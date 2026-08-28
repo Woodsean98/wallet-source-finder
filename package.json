@@ -1,11 +1,11 @@
 {
-  "name": "wallet-source-finder",
-  "version": "1.1.0",
-  "description": "Finds which Solana wallets a target trader is likely copying",
+  "name": "confluence-backtest",
+  "version": "1.0.0",
+  "description": "Scores coins that two watched wallets both bought — peak multiple and price now",
   "type": "module",
-  "main": "server.js",
+  "main": "backtest.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node backtest.js"
   },
   "engines": {
     "node": ">=18"
