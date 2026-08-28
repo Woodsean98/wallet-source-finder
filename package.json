@@ -5,7 +5,7 @@
   "type": "module",
   "main": "backtest.js",
   "scripts": {
-    "start": "node backtest.js"
+    "start": "node server.js"
   },
   "engines": {
     "node": ">=18"
