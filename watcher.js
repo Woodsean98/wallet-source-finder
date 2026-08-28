@@ -1,38 +1,20 @@
 /**
- * CONFLUENCE TRADER v3 — paper always on, live engine armable
- * -----------------------------------------------------------
- * Paper book runs exactly as v2. In addition, a LIVE engine can be
- * armed which mirrors every paper trade with a real swap through
- * Jupiter Ultra (they handle priority fees, slippage, tx landing).
+ * CONFLUENCE TRADER v3.1 — paper always on, live engine armable
+ * -------------------------------------------------------------
+ * v3.1: replaced @solana/web3.js (Node 18 dependency clash) with
+ * minimal ed25519 signing via tweetnacl + bs58. Same behaviour.
  *
- * LIVE is DISARMED unless all of these are true:
- *   - WALLET_PRIVATE_KEY set (base58, from a FRESH dedicated wallet)
- *   - JUPITER_API_KEY set (free at portal.jup.ag)
- *   - armed either by LIVE_TRADING=true env, or by visiting
- *     /arm?key=CONTROL_KEY at runtime
- * Disarm any time: /stop?key=CONTROL_KEY  (instant, no redeploy)
+ * LIVE is DISARMED unless WALLET_PRIVATE_KEY + JUPITER_API_KEY +
+ * HELIUS_API_KEY are set AND you arm it (LIVE_TRADING=true env, or
+ * visit /arm?key=CONTROL_KEY). Disarm: /stop?key=CONTROL_KEY.
  * Auto-disarms if the day's live losses reach LIVE_MAX_DAILY_LOSS_SOL.
  *
- * Required env vars:
- *   WATCH_WALLETS         comma-separated wallet addresses (2)
- *   HELIUS_API_KEY        used as RPC for balance lookups
- * Live-trading env vars:
- *   WALLET_PRIVATE_KEY    base58 private key of the DEDICATED wallet
- *   JUPITER_API_KEY       from portal.jup.ag (free)
- *   CONTROL_KEY           password for /arm and /stop URLs
- *   LIVE_TRADING          "true" to arm on boot (default false)
- *   LIVE_POSITION_SOL     real stake per trade (default 0.05)
- *   LIVE_MAX_OPEN         max concurrent live positions (default 3)
- *   LIVE_MAX_DAILY_LOSS_SOL  auto-disarm threshold (default 0.5)
- * Optional (same as v2):
- *   POSITION_SOL (0.3) SLIPPAGE_PCT (3) MAX_HOLD_MIN (60)
- *   CONFLUENCE_WINDOW_SECONDS (600) SOL_GBP (80)
- *   TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID WEBHOOK_SECRET
+ * Env vars: see v3 notes — unchanged.
  */
 
 import http from "http";
-import { Keypair, VersionedTransaction } from "@solana/web3.js";
 import bs58 from "bs58";
+import nacl from "tweetnacl";
 
 const CONFIG = {
   WATCH_WALLETS: (process.env.WATCH_WALLETS || "")
@@ -48,7 +30,6 @@ const CONFIG = {
   PORT: Number(process.env.PORT || 3000),
   SETTLE_TRIES: 10,
   SETTLE_INTERVAL_MS: 30_000,
-  // live
   HELIUS_KEY: process.env.HELIUS_API_KEY || "",
   WALLET_KEY: process.env.WALLET_PRIVATE_KEY || "",
   JUP_KEY: process.env.JUPITER_API_KEY || "",
@@ -70,13 +51,65 @@ const RPC = CONFIG.HELIUS_KEY
   ? `https://mainnet.helius-rpc.com/?api-key=${CONFIG.HELIUS_KEY}`
   : "";
 
-/* ── wallet ─────────────────────────────────────────────── */
+/* ── wallet (no web3.js — raw ed25519) ──────────────────── */
 
-let liveWallet = null;
+let liveWallet = null;   // { secretKey: Uint8Array(64), publicKey: base58 string, publicKeyBytes }
 let liveWalletError = "";
 try {
-  if (CONFIG.WALLET_KEY) liveWallet = Keypair.fromSecretKey(bs58.decode(CONFIG.WALLET_KEY));
-} catch (e) { liveWalletError = "WALLET_PRIVATE_KEY invalid (must be base58 export from Phantom)"; }
+  if (CONFIG.WALLET_KEY) {
+    const decoded = bs58.decode(CONFIG.WALLET_KEY.trim());
+    if (decoded.length !== 64) throw new Error(`key is ${decoded.length} bytes, expected 64`);
+    const publicKeyBytes = decoded.slice(32);
+    liveWallet = {
+      secretKey: decoded,
+      publicKeyBytes,
+      publicKey: bs58.encode(publicKeyBytes),
+    };
+  }
+} catch (e) {
+  liveWalletError = `WALLET_PRIVATE_KEY invalid (${e.message}) — use Phantom's base58 export`;
+}
+
+/**
+ * Sign a base64 serialized Solana transaction (legacy or v0) with our key.
+ * Layout: [compact-u16 sig count][64-byte sigs...][message]
+ */
+function signTransactionBase64(b64) {
+  const buf = Buffer.from(b64, "base64");
+  // compact-u16 decode
+  let sigCount = 0, sizeBytes = 0;
+  for (;;) {
+    const b = buf[sizeBytes];
+    sigCount |= (b & 0x7f) << (7 * sizeBytes);
+    sizeBytes++;
+    if ((b & 0x80) === 0) break;
+  }
+  const msgStart = sizeBytes + 64 * sigCount;
+  const message = buf.slice(msgStart);
+
+  // find our slot among required signers
+  let o = 0;
+  if (message[o] & 0x80) o += 1;             // v0 version byte
+  const numRequired = message[o]; o += 3;    // header: required, ro-signed, ro-unsigned
+  let keyCount = 0, kSize = 0;
+  for (;;) {
+    const b = message[o + kSize];
+    keyCount |= (b & 0x7f) << (7 * kSize);
+    kSize++;
+    if ((b & 0x80) === 0) break;
+  }
+  o += kSize;
+  let slot = -1;
+  for (let i = 0; i < Math.min(numRequired, keyCount); i++) {
+    const key = message.slice(o + i * 32, o + i * 32 + 32);
+    if (Buffer.compare(key, Buffer.from(liveWallet.publicKeyBytes)) === 0) { slot = i; break; }
+  }
+  if (slot === -1) throw new Error("our wallet is not a required signer on this transaction");
+
+  const sig = nacl.sign.detached(new Uint8Array(message), new Uint8Array(liveWallet.secretKey));
+  Buffer.from(sig).copy(buf, sizeBytes + 64 * slot);
+  return buf.toString("base64");
+}
 
 const liveReady = () => !!(liveWallet && CONFIG.JUP_KEY && RPC);
 let liveArmed = CONFIG.LIVE_ON_BOOT && liveReady();
@@ -92,11 +125,11 @@ const closedTrades = [];
 const recentBuys = [];
 let webhookHits = 0;
 
-const liveOpen = new Map();      // mint -> { mint, solIn, tokensRaw, sig, openedAt, status }
-const liveClosed = [];           // { mint, solIn, solOut, pnlSol, reason, sigBuy, sigSell, closedAt, stuck }
+const liveOpen = new Map();
+const liveClosed = [];
 let liveDay = new Date().toISOString().slice(0, 10);
 let liveDayPnl = 0;
-let walletSol = null;            // cached balance display
+let walletSol = null;
 
 const short = (a) => `${a.slice(0, 4)}…${a.slice(-4)}`;
 const now = () => Math.floor(Date.now() / 1000);
@@ -169,14 +202,14 @@ async function rpcCall(method, params) {
 async function getWalletSol() {
   if (!liveWallet || !RPC) return null;
   try {
-    const r = await rpcCall("getBalance", [liveWallet.publicKey.toBase58()]);
+    const r = await rpcCall("getBalance", [liveWallet.publicKey]);
     return r.value / LAMPORTS;
   } catch { return null; }
 }
 
 async function getTokenRawBalance(mint) {
   const r = await rpcCall("getTokenAccountsByOwner", [
-    liveWallet.publicKey.toBase58(), { mint }, { encoding: "jsonParsed" },
+    liveWallet.publicKey, { mint }, { encoding: "jsonParsed" },
   ]);
   let total = 0n;
   for (const acc of r.value || []) {
@@ -192,15 +225,13 @@ async function ultraSwap(inputMint, outputMint, rawAmount) {
   const slippageBps = Math.round(CONFIG.SLIPPAGE * 10_000);
   const url =
     `https://api.jup.ag/ultra/v1/order?inputMint=${inputMint}&outputMint=${outputMint}` +
-    `&amount=${rawAmount}&taker=${liveWallet.publicKey.toBase58()}&slippageBps=${slippageBps}`;
+    `&amount=${rawAmount}&taker=${liveWallet.publicKey}&slippageBps=${slippageBps}`;
   const orderRes = await fetch(url, { headers: { "x-api-key": CONFIG.JUP_KEY } });
   const order = await orderRes.json();
   if (!order.transaction || !order.requestId) {
     throw new Error(`order failed: ${order.error || order.message || orderRes.status}`);
   }
-  const tx = VersionedTransaction.deserialize(Buffer.from(order.transaction, "base64"));
-  tx.sign([liveWallet]);
-  const signedTransaction = Buffer.from(tx.serialize()).toString("base64");
+  const signedTransaction = signTransactionBase64(order.transaction);
 
   const execRes = await fetch("https://api.jup.ag/ultra/v1/execute", {
     method: "POST",
@@ -211,7 +242,7 @@ async function ultraSwap(inputMint, outputMint, rawAmount) {
   if (exec.status !== "Success") {
     throw new Error(`execute failed: ${exec.error || exec.code || exec.status}`);
   }
-  return exec; // { signature, inputAmountResult, outputAmountResult, ... }
+  return exec;
 }
 
 /* ── live engine ────────────────────────────────────────── */
@@ -304,7 +335,7 @@ async function liveSell(mint, reason, attempt = 1) {
   }
 }
 
-/* ── paper book (unchanged from v2) ─────────────────────── */
+/* ── paper book ─────────────────────────────────────────── */
 
 function stats() {
   const priced = closedTrades.filter((t) => !t.unpriced);
@@ -392,7 +423,6 @@ async function closePosition(mint, reason) {
   settling.set(mint, { pos, reason, tries: 0, startedAt: now() });
 }
 
-/* settling retry loop */
 setInterval(async () => {
   for (const [mint, s] of [...settling]) {
     s.tries++;
@@ -402,7 +432,6 @@ setInterval(async () => {
   }
 }, CONFIG.SETTLE_INTERVAL_MS);
 
-/* timeout sweep + peak + balance cache + housekeeping */
 setInterval(async () => {
   const cutoff = now() - CONFIG.MAX_HOLD_MIN * 60;
   for (const [mint, pos] of [...openPositions]) {
@@ -624,7 +653,7 @@ function renderPage() {
 </style></head><body>
   <h1>Confluence <em>trader</em></h1>
   <div class="sub">
-    v3 · ${CONFIG.WATCH_WALLETS.map((w) => esc(short(w))).join(" + ")} ·
+    v3.1 · ${CONFIG.WATCH_WALLETS.map((w) => esc(short(w))).join(" + ")} ·
     paper ${CONFIG.POSITION_SOL} SOL/trade · exit on their sell or ${CONFIG.MAX_HOLD_MIN}m ·
     ${CONFIG.SLIPPAGE * 100}% slippage · ${webhookHits} webhook hits ·
     ${CONFIG.TG_TOKEN ? "telegram ✓" : "TELEGRAM NOT SET"}
@@ -721,7 +750,7 @@ const server = http.createServer((req, res) => {
 });
 
 server.listen(CONFIG.PORT, () => {
-  console.log(`Confluence trader v3 on ${CONFIG.PORT} — live ${liveArmed ? "ARMED" : "disarmed"}, ready=${liveReady()}`);
+  console.log(`Confluence trader v3.1 on ${CONFIG.PORT} — live ${liveArmed ? "ARMED" : "disarmed"}, ready=${liveReady()}`);
   if (CONFIG.WATCH_WALLETS.length < 2) console.warn("WARNING: fewer than 2 wallets — confluence can never fire.");
   if (liveWalletError) console.warn(liveWalletError);
 });
