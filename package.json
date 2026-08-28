@@ -1,11 +1,15 @@
 {
-  "name": "confluence-backtest",
-  "version": "1.0.0",
-  "description": "Scores coins that two watched wallets both bought — peak multiple and price now",
+  "name": "confluence-trader",
+  "version": "3.0.0",
+  "description": "Paper trades confluence between watched wallets; live engine armable via Jupiter Ultra",
   "type": "module",
-  "main": "backtest.js",
+  "main": "watcher.js",
   "scripts": {
     "start": "node watcher.js"
+  },
+  "dependencies": {
+    "@solana/web3.js": "^1.95.0",
+    "bs58": "^5.0.0"
   },
   "engines": {
     "node": ">=18"
