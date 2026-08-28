@@ -1,6 +1,6 @@
 {
   "name": "confluence-trader",
-  "version": "3.0.0",
+  "version": "3.1.0",
   "description": "Paper trades confluence between watched wallets; live engine armable via Jupiter Ultra",
   "type": "module",
   "main": "watcher.js",
@@ -8,8 +8,8 @@
     "start": "node watcher.js"
   },
   "dependencies": {
-    "@solana/web3.js": "^1.95.0",
-    "bs58": "^5.0.0"
+    "bs58": "^5.0.0",
+    "tweetnacl": "^1.0.3"
   },
   "engines": {
     "node": ">=18"
