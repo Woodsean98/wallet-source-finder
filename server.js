@@ -1,11 +1,12 @@
 /**
- * WALLET SOURCE FINDER — Railway service
- * --------------------------------------
+ * WALLET SOURCE FINDER — Railway service  (v1.2)
+ * ----------------------------------------------
  * Runs the source-wallet analysis once on boot, then serves the results
- * as a mobile page so you can read them on a phone instead of in deploy logs.
+ * as a mobile page.
  *
- * Deploy as its OWN Railway service. Do not merge into the Narrative Sniper
- * worker — this would re-run the full analysis on every restart of that worker.
+ * v1.2: three-path buy detection (direct / swap-event / routed),
+ *       Fomo + OKX infrastructure denylisted,
+ *       per-target buy counts with a loud warning when a target yields zero.
  *
  * Required env vars:  HELIUS_API_KEY, TARGET_WALLETS
  */
@@ -45,6 +46,9 @@ const DENYLIST = new Set([
   "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4",
   "routeUGWgWzqBWFcrCfv8tritsqukccJPu3q5GPP3xS",
   "9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM",
+  // Found by our own runs — platform infrastructure, not traders:
+  "AgmLJBMDCqWynYnQiPCuj9ewsNNsBJXyzoUhD9LJzN51", // Fomo co-signer
+  "ARu4n5mFdZogZAravu7CcizaojWnS6oqka37gdLT5SZn", // OKX router
 ]);
 
 const QUOTE_MINTS = new Set([
@@ -70,6 +74,7 @@ const state = {
   startedAt: null,
   finishedAt: null,
   results: [],
+  targetSummaries: [],
   error: null,
   log: [],
 };
@@ -141,27 +146,62 @@ async function mapLimit(items, limit, fn) {
 }
 
 /* ────────────────────────────────────────────────────────────────
-   Buy detection
+   Buy detection — three paths
    ──────────────────────────────────────────────────────────────── */
 
+/**
+ * Path A (direct):     wallet receives a non-quote token, and paid for it.
+ * Path B (swap-event): Helius parsed the tx as a swap and the wallet is the
+ *                      fee payer — trust the parsed tokenOutputs.
+ * Path C (routed):     wallet is the fee payer and spent SOL/quote, but the
+ *                      token landed on an intermediary account (pro setups,
+ *                      trading bots, some routers). We take the non-quote
+ *                      token that the wallet did NOT send as the buy.
+ */
 function extractBuy(tx, wallet) {
   const transfers = tx.tokenTransfers || [];
-  if (!transfers.length) return null;
 
-  const received = transfers.find(
-    (t) => t.toUserAccount === wallet && t.mint && !QUOTE_MINTS.has(t.mint)
+  const paidNative = (tx.nativeTransfers || []).some(
+    (t) => t.fromUserAccount === wallet && Number(t.amount) > 1_000_000 // > 0.001 SOL
   );
-  if (!received) return null;
-
   const paidToken = transfers.some(
     (t) => t.fromUserAccount === wallet && QUOTE_MINTS.has(t.mint)
   );
-  const paidNative = (tx.nativeTransfers || []).some(
-    (t) => t.fromUserAccount === wallet && Number(t.amount) > 1_000_000
-  );
-  if (!paidToken && !paidNative) return null;
+  const paid = paidNative || paidToken;
 
-  return { mint: received.mint, timestamp: tx.timestamp, signature: tx.signature };
+  // Path A — direct receipt
+  const direct = transfers.find(
+    (t) => t.toUserAccount === wallet && t.mint && !QUOTE_MINTS.has(t.mint)
+  );
+  if (direct && paid) {
+    return { mint: direct.mint, timestamp: tx.timestamp, signature: tx.signature, via: "direct" };
+  }
+
+  // Path B — Helius-parsed swap event
+  const swap = tx.events && tx.events.swap;
+  if (swap && tx.feePayer === wallet) {
+    const outs = (swap.tokenOutputs || []).filter(
+      (o) => o.mint && !QUOTE_MINTS.has(o.mint)
+    );
+    const soldNonQuote = (swap.tokenInputs || []).some(
+      (i) => i.mint && !QUOTE_MINTS.has(i.mint)
+    );
+    if (outs.length && !soldNonQuote) {
+      return { mint: outs[0].mint, timestamp: tx.timestamp, signature: tx.signature, via: "swap-event" };
+    }
+  }
+
+  // Path C — routed buy (token landed on an intermediary)
+  if (tx.feePayer === wallet && paid) {
+    const routed = transfers.find(
+      (t) => t.mint && !QUOTE_MINTS.has(t.mint) && t.fromUserAccount !== wallet
+    );
+    if (routed) {
+      return { mint: routed.mint, timestamp: tx.timestamp, signature: tx.signature, via: "routed" };
+    }
+  }
+
+  return null;
 }
 
 function extractBuyersOfMint(tx, mint) {
@@ -177,7 +217,9 @@ function extractBuyersOfMint(tx, mint) {
 
 async function fetchWalletBuys(wallet, cutoffTs) {
   const buys = [];
+  const viaCounts = { direct: 0, "swap-event": 0, routed: 0 };
   let before;
+
   for (let page = 1; page <= 200; page++) {
     const batch = await heliusGet(txUrl(wallet, { before }));
     if (!batch.length) break;
@@ -187,7 +229,10 @@ async function fetchWalletBuys(wallet, cutoffTs) {
       if (!tx.timestamp) continue;
       if (tx.timestamp < cutoffTs) { hitCutoff = true; break; }
       const buy = extractBuy(tx, wallet);
-      if (buy) buys.push(buy);
+      if (buy) {
+        buys.push(buy);
+        viaCounts[buy.via]++;
+      }
     }
 
     state.message = `Reading history — page ${page}, ${buys.length} buys found`;
@@ -195,6 +240,8 @@ async function fetchWalletBuys(wallet, cutoffTs) {
     before = batch[batch.length - 1].signature;
     await sleep(120);
   }
+
+  logLine(`  detection: ${viaCounts.direct} direct, ${viaCounts["swap-event"]} swap-event, ${viaCounts.routed} routed`);
   return buys;
 }
 
@@ -259,6 +306,7 @@ async function runAnalysis() {
     startedAt: Date.now(),
     finishedAt: null,
     results: [],
+    targetSummaries: [],
     error: null,
     apiCalls: 0,
     buysAnalysed: 0,
@@ -279,7 +327,8 @@ async function runAnalysis() {
 
       const allBuys = await fetchWalletBuys(wallet, cutoffTs);
       if (!allBuys.length) {
-        logLine(`  no buys found — check the address`);
+        logLine(`  NO BUYS DETECTED — flagging on the page`);
+        state.targetSummaries.push({ wallet, uniqueTokens: 0, analysed: 0 });
         continue;
       }
 
@@ -290,6 +339,7 @@ async function runAnalysis() {
 
       const buys = sample([...firstByMint.values()], CONFIG.MAX_BUYS_PER_WALLET);
       logLine(`  ${firstByMint.size} unique tokens, analysing ${buys.length}`);
+      state.targetSummaries.push({ wallet, uniqueTokens: firstByMint.size, analysed: buys.length });
 
       state.progressDone = 0;
       state.progressTotal = buys.length;
@@ -359,6 +409,8 @@ const esc = (s) =>
     ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])
   );
 
+const shortAddr = (a) => `${a.slice(0, 4)}…${a.slice(-4)}`;
+
 function renderPage() {
   const { phase, message, results } = state;
   const running = phase === "running";
@@ -367,6 +419,23 @@ function renderPage() {
     : 0;
 
   const maxLead = Math.max(CONFIG.WINDOW_SECONDS, ...results.map((r) => r.medianLeadSec), 1);
+
+  const failedTargets = state.targetSummaries.filter((t) => t.analysed === 0);
+  const targetWarning = failedTargets.length
+    ? `<div class="empty alarm">
+         <h3>${failedTargets.length} target(s) had no detectable buys</h3>
+         <p>${failedTargets.map((t) => esc(shortAddr(t.wallet))).join(", ")} —
+            these wallets contributed nothing to this run, so results only
+            reflect the remaining target(s). Their trade routing may still
+            be outside what the detector recognises.</p>
+       </div>`
+    : "";
+
+  const targetLines = state.targetSummaries.length
+    ? `<div class="targets">${state.targetSummaries
+        .map((t) => `${esc(shortAddr(t.wallet))}: ${t.uniqueTokens} tokens, ${t.analysed} analysed`)
+        .join(" · ")}</div>`
+    : "";
 
   const rows = results
     .map((r, i) => {
@@ -457,6 +526,10 @@ ${running ? '<meta http-equiv="refresh" content="6">' : ""}
   .status.live{border-left-color:var(--cyan)}
   .status .msg{color:var(--ink)}
   .status .sub{color:var(--slate);font-size:11.5px;margin-top:5px}
+  .targets{
+    margin-top:8px;font-size:11px;color:var(--slate);
+    border-top:1px dashed var(--edge);padding-top:8px;
+  }
   .pulse{
     display:inline-block;width:7px;height:7px;border-radius:50%;
     background:var(--cyan);margin-right:7px;vertical-align:middle;
@@ -521,7 +594,7 @@ ${running ? '<meta http-equiv="refresh" content="6">' : ""}
 
   .empty{
     background:var(--panel);border:1px solid var(--edge);
-    padding:20px;margin-top:8px;
+    padding:20px;margin-top:8px;margin-bottom:10px;
   }
   .empty.alarm{border-color:var(--clay)}
   .empty h3{
@@ -566,10 +639,12 @@ ${running ? '<meta http-equiv="refresh" content="6">' : ""}
         ${state.apiCalls} API calls ·
         ${elapsed}s elapsed
       </div>
+      ${targetLines}
     </div>
   </header>
 
   ${blocked}
+  ${targetWarning}
   ${empty}
 
   ${results.length ? `
@@ -617,7 +692,7 @@ const server = http.createServer(async (req, res) => {
 
   if (url.pathname === "/results.json") {
     res.writeHead(200, { "Content-Type": "application/json" });
-    return res.end(JSON.stringify({ phase: state.phase, results: state.results }, null, 2));
+    return res.end(JSON.stringify({ phase: state.phase, targets: state.targetSummaries, results: state.results }, null, 2));
   }
 
   if (url.pathname === "/results.csv") {
@@ -634,6 +709,7 @@ const server = http.createServer(async (req, res) => {
       phase: state.phase, message: state.message,
       done: state.progressDone, total: state.progressTotal,
       apiCalls: state.apiCalls, candidates: state.results.length,
+      targets: state.targetSummaries,
     }));
   }
 
