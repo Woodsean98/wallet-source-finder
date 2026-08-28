@@ -1,18 +1,15 @@
 /**
- * CONFLUENCE TRADER v3.1 — paper always on, live engine armable
+ * CONFLUENCE TRADER v3.2 — paper always on, live engine armable
  * -------------------------------------------------------------
- * v3.1: replaced @solana/web3.js (Node 18 dependency clash) with
- * minimal ed25519 signing via tweetnacl + bs58. Same behaviour.
- *
- * LIVE is DISARMED unless WALLET_PRIVATE_KEY + JUPITER_API_KEY +
- * HELIUS_API_KEY are set AND you arm it (LIVE_TRADING=true env, or
- * visit /arm?key=CONTROL_KEY). Disarm: /stop?key=CONTROL_KEY.
- * Auto-disarms if the day's live losses reach LIVE_MAX_DAILY_LOSS_SOL.
- *
- * Env vars: see v3 notes — unchanged.
+ * v3.2: wallet can be provided EITHER as
+ *   WALLET_PRIVATE_KEY  (base58, 64-byte)   — or —
+ *   WALLET_SEED_PHRASE  (12/24 words; derives m/44'/501'/0'/0',
+ *                        the standard Phantom/Solflare/BONKbot account)
+ * Everything else identical to v3.1.
  */
 
 import http from "http";
+import crypto from "crypto";
 import bs58 from "bs58";
 import nacl from "tweetnacl";
 
@@ -32,6 +29,7 @@ const CONFIG = {
   SETTLE_INTERVAL_MS: 30_000,
   HELIUS_KEY: process.env.HELIUS_API_KEY || "",
   WALLET_KEY: process.env.WALLET_PRIVATE_KEY || "",
+  WALLET_SEED: process.env.WALLET_SEED_PHRASE || "",
   JUP_KEY: process.env.JUPITER_API_KEY || "",
   CONTROL_KEY: process.env.CONTROL_KEY || "",
   LIVE_ON_BOOT: (process.env.LIVE_TRADING || "false") === "true",
@@ -51,32 +49,56 @@ const RPC = CONFIG.HELIUS_KEY
   ? `https://mainnet.helius-rpc.com/?api-key=${CONFIG.HELIUS_KEY}`
   : "";
 
-/* ── wallet (no web3.js — raw ed25519) ──────────────────── */
+/* ── wallet: private key OR seed phrase ─────────────────── */
 
-let liveWallet = null;   // { secretKey: Uint8Array(64), publicKey: base58 string, publicKeyBytes }
+function seedPhraseToKeypair(phrase) {
+  const mnemonic = phrase.trim().toLowerCase().replace(/\s+/g, " ");
+  const words = mnemonic.split(" ");
+  if (words.length !== 12 && words.length !== 24) {
+    throw new Error(`seed phrase has ${words.length} words, expected 12 or 24`);
+  }
+  const seed = crypto.pbkdf2Sync(
+    mnemonic.normalize("NFKD"), "mnemonic".normalize("NFKD"), 2048, 64, "sha512"
+  );
+  let I = crypto.createHmac("sha512", "ed25519 seed").update(seed).digest();
+  let key = I.subarray(0, 32), chain = I.subarray(32);
+  for (const seg of [44, 501, 0, 0]) {
+    const idx = ((seg | 0x80000000) >>> 0);
+    const data = Buffer.concat([
+      Buffer.from([0]), key,
+      Buffer.from([(idx >>> 24) & 0xff, (idx >>> 16) & 0xff, (idx >>> 8) & 0xff, idx & 0xff]),
+    ]);
+    I = crypto.createHmac("sha512", chain).update(data).digest();
+    key = I.subarray(0, 32); chain = I.subarray(32);
+  }
+  return nacl.sign.keyPair.fromSeed(new Uint8Array(key));
+}
+
+let liveWallet = null;
 let liveWalletError = "";
 try {
   if (CONFIG.WALLET_KEY) {
     const decoded = bs58.decode(CONFIG.WALLET_KEY.trim());
     if (decoded.length !== 64) throw new Error(`key is ${decoded.length} bytes, expected 64`);
-    const publicKeyBytes = decoded.slice(32);
     liveWallet = {
-      secretKey: decoded,
-      publicKeyBytes,
-      publicKey: bs58.encode(publicKeyBytes),
+      secretKey: new Uint8Array(decoded),
+      publicKeyBytes: new Uint8Array(decoded.slice(32)),
+      publicKey: bs58.encode(decoded.slice(32)),
+    };
+  } else if (CONFIG.WALLET_SEED) {
+    const kp = seedPhraseToKeypair(CONFIG.WALLET_SEED);
+    liveWallet = {
+      secretKey: kp.secretKey,
+      publicKeyBytes: kp.publicKey,
+      publicKey: bs58.encode(Buffer.from(kp.publicKey)),
     };
   }
 } catch (e) {
-  liveWalletError = `WALLET_PRIVATE_KEY invalid (${e.message}) — use Phantom's base58 export`;
+  liveWalletError = `wallet config invalid (${e.message})`;
 }
 
-/**
- * Sign a base64 serialized Solana transaction (legacy or v0) with our key.
- * Layout: [compact-u16 sig count][64-byte sigs...][message]
- */
 function signTransactionBase64(b64) {
   const buf = Buffer.from(b64, "base64");
-  // compact-u16 decode
   let sigCount = 0, sizeBytes = 0;
   for (;;) {
     const b = buf[sizeBytes];
@@ -87,10 +109,9 @@ function signTransactionBase64(b64) {
   const msgStart = sizeBytes + 64 * sigCount;
   const message = buf.slice(msgStart);
 
-  // find our slot among required signers
   let o = 0;
-  if (message[o] & 0x80) o += 1;             // v0 version byte
-  const numRequired = message[o]; o += 3;    // header: required, ro-signed, ro-unsigned
+  if (message[o] & 0x80) o += 1;
+  const numRequired = message[o]; o += 3;
   let keyCount = 0, kSize = 0;
   for (;;) {
     const b = message[o + kSize];
@@ -106,7 +127,7 @@ function signTransactionBase64(b64) {
   }
   if (slot === -1) throw new Error("our wallet is not a required signer on this transaction");
 
-  const sig = nacl.sign.detached(new Uint8Array(message), new Uint8Array(liveWallet.secretKey));
+  const sig = nacl.sign.detached(new Uint8Array(message), liveWallet.secretKey);
   Buffer.from(sig).copy(buf, sizeBytes + 64 * slot);
   return buf.toString("base64");
 }
@@ -330,7 +351,7 @@ async function liveSell(mint, reason, attempt = 1) {
     pos.status = "stuck";
     sendTelegram(
       `🚨 <b>LIVE POSITION STUCK</b>\n<code>${mint}</code>\n` +
-      `Sell failed 4x: ${e.message}\nSell it manually from Phantom, then /clear-stuck?key=…&mint=${mint}`
+      `Sell failed 4x: ${e.message}\nSell it manually, then /clear-stuck?key=…&mint=${mint}`
     );
   }
 }
@@ -555,12 +576,12 @@ function renderPage() {
 
   let liveBanner;
   if (liveArmed) {
-    liveBanner = `<div class="banner armed">🔴 LIVE ARMED — ${CONFIG.LIVE_POSITION_SOL} SOL/trade real money · day ${ls.dayPnl >= 0 ? "+" : ""}${ls.dayPnl} SOL · cap −${CONFIG.LIVE_MAX_DAILY_LOSS} · wallet ${walletSol === null ? "?" : walletSol.toFixed(3)} SOL</div>`;
+    liveBanner = `<div class="banner armed">🔴 LIVE ARMED — ${CONFIG.LIVE_POSITION_SOL} SOL/trade real money · day ${ls.dayPnl >= 0 ? "+" : ""}${ls.dayPnl} SOL · cap −${CONFIG.LIVE_MAX_DAILY_LOSS} · wallet ${walletSol === null ? "?" : walletSol.toFixed(3)} SOL (${esc(short(liveWallet.publicKey))})</div>`;
   } else if (liveReady()) {
-    liveBanner = `<div class="banner ready">⚪️ Live engine ready, DISARMED (${esc(disarmReason)}) · wallet ${walletSol === null ? "?" : walletSol.toFixed(3)} SOL · arm via /arm?key=…</div>`;
+    liveBanner = `<div class="banner ready">⚪️ Live engine ready, DISARMED (${esc(disarmReason)}) · wallet ${walletSol === null ? "?" : walletSol.toFixed(3)} SOL (${esc(short(liveWallet.publicKey))}) · arm via /arm?key=…</div>`;
   } else {
     const missing = [];
-    if (!liveWallet) missing.push(liveWalletError || "WALLET_PRIVATE_KEY");
+    if (!liveWallet) missing.push(liveWalletError || "WALLET_PRIVATE_KEY or WALLET_SEED_PHRASE");
     if (!CONFIG.JUP_KEY) missing.push("JUPITER_API_KEY");
     if (!RPC) missing.push("HELIUS_API_KEY");
     liveBanner = `<div class="banner off">⚪️ Live engine not configured — missing: ${esc(missing.join(", "))}. Paper only.</div>`;
@@ -653,7 +674,7 @@ function renderPage() {
 </style></head><body>
   <h1>Confluence <em>trader</em></h1>
   <div class="sub">
-    v3.1 · ${CONFIG.WATCH_WALLETS.map((w) => esc(short(w))).join(" + ")} ·
+    v3.2 · ${CONFIG.WATCH_WALLETS.map((w) => esc(short(w))).join(" + ")} ·
     paper ${CONFIG.POSITION_SOL} SOL/trade · exit on their sell or ${CONFIG.MAX_HOLD_MIN}m ·
     ${CONFIG.SLIPPAGE * 100}% slippage · ${webhookHits} webhook hits ·
     ${CONFIG.TG_TOKEN ? "telegram ✓" : "TELEGRAM NOT SET"}
@@ -714,7 +735,7 @@ const server = http.createServer((req, res) => {
 
   if (path === "/arm") {
     if (!keyOk) { res.writeHead(403); return res.end("bad key (CONTROL_KEY must be set and match)"); }
-    if (!liveReady()) { res.writeHead(400); return res.end("live engine not configured — check WALLET_PRIVATE_KEY / JUPITER_API_KEY / HELIUS_API_KEY"); }
+    if (!liveReady()) { res.writeHead(400); return res.end("live engine not configured — check wallet / JUPITER_API_KEY / HELIUS_API_KEY"); }
     rolloverLiveDay();
     liveArmed = true; disarmReason = "";
     sendTelegram(`🔴 <b>LIVE ARMED</b> — ${CONFIG.LIVE_POSITION_SOL} SOL/trade, max ${CONFIG.LIVE_MAX_OPEN} open, daily cap −${CONFIG.LIVE_MAX_DAILY_LOSS} SOL.`);
@@ -750,7 +771,7 @@ const server = http.createServer((req, res) => {
 });
 
 server.listen(CONFIG.PORT, () => {
-  console.log(`Confluence trader v3.1 on ${CONFIG.PORT} — live ${liveArmed ? "ARMED" : "disarmed"}, ready=${liveReady()}`);
+  console.log(`Confluence trader v3.2 on ${CONFIG.PORT} — live ${liveArmed ? "ARMED" : "disarmed"}, ready=${liveReady()}`);
   if (CONFIG.WATCH_WALLETS.length < 2) console.warn("WARNING: fewer than 2 wallets — confluence can never fire.");
   if (liveWalletError) console.warn(liveWalletError);
 });
