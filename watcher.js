@@ -1,20 +1,16 @@
 /**
- * CONFLUENCE TRADER v4 — filtered
- * --------------------------------
- * Changes from v3.2, all data-driven from the 400-trade autopsy:
- *  - CORPSE CUT: position <=0.75x entry after CORPSE_MIN minutes with no
- *    sell signal -> exit immediately (timeouts caused ~94% of live losses)
- *  - MAX_HOLD_MIN default 30 (was 60)
- *  - NIGHT WINDOW: no new LIVE buys 23:00-07:00 UK (paper runs 24/7)
- *  - WALLET FLOOR: live disarms if balance < LIVE_MIN_WALLET_SOL
- *  - FEE-HONEST live book: est fees/rent per trade shown + netted
- *  - Logs FHpc's buy size per confluence (conviction filter research)
+ * CONFLUENCE TRADER v4.1
+ * ----------------------
+ * v4 + TRAILING STOP:
+ *  - peak tracked every 15s on open positions
+ *  - once peak >= TRAIL_ARM_MULT x entry (default 1.5x), a retrace of
+ *    TRAIL_RETRACE_PCT % from peak (default 30%) exits the position
+ *    (paper + live), independent of the bots' sells
+ *  - also fixes FHpc buy-size capture when he pays via wrapped SOL
  *
- * Env (new/changed):
- *   MAX_HOLD_MIN (30) CORPSE_MIN (10) CORPSE_MULT (0.75)
- *   NIGHT_START_HOUR (23) NIGHT_END_HOUR (7)     UK hours, live buys paused
- *   LIVE_MIN_WALLET_SOL (0.5) LIVE_FEE_EST_SOL (0.0045)
- * Everything else as v3.2.
+ * Env (new):
+ *   TRAIL_ARM_MULT (1.5)  TRAIL_RETRACE_PCT (30)
+ * Everything else as v4.
  */
 
 import http from "http";
@@ -31,6 +27,8 @@ const CONFIG = {
   MAX_HOLD_MIN: Number(process.env.MAX_HOLD_MIN || 30),
   CORPSE_MIN: Number(process.env.CORPSE_MIN || 10),
   CORPSE_MULT: Number(process.env.CORPSE_MULT || 0.75),
+  TRAIL_ARM: Number(process.env.TRAIL_ARM_MULT || 1.5),
+  TRAIL_RETRACE: Number(process.env.TRAIL_RETRACE_PCT || 30) / 100,
   NIGHT_START: Number(process.env.NIGHT_START_HOUR || 23),
   NIGHT_END: Number(process.env.NIGHT_END_HOUR || 7),
   SOL_GBP: Number(process.env.SOL_GBP || 80),
@@ -65,7 +63,7 @@ const RPC = CONFIG.HELIUS_KEY
   : "";
 const FHPC = "FHpcNSe6tb2n15bAdq4BkeYWGyZKFD7yLYrH92ng7wCT";
 
-/* ── wallet: private key OR seed phrase ─────────────────── */
+/* ── wallet ─────────────────────────────────────────────── */
 
 function seedPhraseToKeypair(phrase) {
   const mnemonic = phrase.trim().toLowerCase().replace(/\s+/g, " ");
@@ -169,7 +167,7 @@ function nightWindow() {
 
 /* ── state ──────────────────────────────────────────────── */
 
-const buysByMint = new Map();     // mint -> Map(wallet -> {ts, sizeSol})
+const buysByMint = new Map();
 const alerted = new Set();
 const openPositions = new Map();
 const settling = new Map();
@@ -316,7 +314,7 @@ async function liveBuy(mint, gap, fhpcSize) {
   rolloverLiveDay();
   if (!liveArmed) return;
   if (nightWindow()) {
-    console.log(`LIVE skip ${mint} — night window (${CONFIG.NIGHT_START}:00-${CONFIG.NIGHT_END}:00 UK)`);
+    console.log(`LIVE skip ${mint} — night window`);
     return;
   }
   if (liveOpen.size >= CONFIG.LIVE_MAX_OPEN) {
@@ -336,7 +334,6 @@ async function liveBuy(mint, gap, fhpcSize) {
       `🔴 <b>LIVE BUY</b> ${solIn.toFixed(4)} SOL\n\n<code>${mint}</code>\n` +
       `gap ${gap}s · FHpc in ${fhpcSize ? fhpcSize.toFixed(3) : "?"} SOL\n📊 dexscreener.com/solana/${mint}\n🔎 solscan.io/tx/${exec.signature || ""}`
     );
-    console.log(`LIVE BUY ${mint} ${solIn} SOL sig=${exec.signature}`);
   } catch (e) {
     sendTelegram(`⚠️ <b>LIVE BUY FAILED</b>\n<code>${mint}</code>\n${e.message}\nNo position opened.`);
     console.error(`LIVE BUY FAILED ${mint}: ${e.message}`);
@@ -371,7 +368,6 @@ async function liveSell(mint, reason, attempt = 1) {
       `${pnlSol >= 0 ? "+" : ""}${pnlSol} SOL (in ${pos.solIn.toFixed(4)} → out ${solOut.toFixed(4)})\n` +
       `Day: ${liveDayPnl >= 0 ? "+" : ""}${liveDayPnl.toFixed(4)} SOL\n🔎 solscan.io/tx/${exec.signature || ""}`
     );
-    console.log(`LIVE SELL ${mint} pnl=${pnlSol} (${reason})`);
 
     if (liveDayPnl <= -CONFIG.LIVE_MAX_DAILY_LOSS) {
       disarm(`daily loss cap hit (${liveDayPnl.toFixed(4)} SOL)`);
@@ -428,16 +424,13 @@ function liveStats() {
 
 async function openPosition(mint, gap, firstW, secondW, fhpcSize) {
   const px = await fetchPriceSol(mint);
-  if (!px) {
-    console.log(`SKIP ${mint} — no price available at entry`);
-    return;
-  }
+  if (!px) { console.log(`SKIP ${mint} — no entry price`); return; }
   const entryPrice = px * (1 + CONFIG.SLIPPAGE);
   const tokens = CONFIG.POSITION_SOL / entryPrice;
   openPositions.set(mint, {
     mint, entryPrice, tokens, gap,
     openedAt: now(), first: firstW, second: secondW,
-    peakPrice: px, fhpcSize,
+    peakPrice: px, fhpcSize, trailArmed: false,
   });
   sendTelegram(
     `🟢 <b>PAPER BUY</b> ${CONFIG.POSITION_SOL} SOL\n\n<code>${mint}</code>\n` +
@@ -451,11 +444,12 @@ function finalizeTrade(pos, reason, exitRaw, unpriced = false) {
   const pnlSol = unpriced ? 0 : proceeds - CONFIG.POSITION_SOL;
   const mult = !unpriced && pos.entryPrice > 0 ? exitPrice / pos.entryPrice : 0;
   const heldMin = Math.round((now() - pos.openedAt) / 60);
+  const peakMult = pos.entryPrice > 0 ? +(pos.peakPrice / pos.entryPrice).toFixed(2) : 0;
 
   closedTrades.push({
     mint: pos.mint, reason, heldMin,
     entryPrice: pos.entryPrice, exitPrice,
-    mult: +mult.toFixed(3), pnlSol: +pnlSol.toFixed(4),
+    mult: +mult.toFixed(3), peakMult, pnlSol: +pnlSol.toFixed(4),
     closedAt: now(), gap: pos.gap, unpriced, fhpcSize: pos.fhpcSize || null,
   });
   while (closedTrades.length > 400) closedTrades.shift();
@@ -465,7 +459,7 @@ function finalizeTrade(pos, reason, exitRaw, unpriced = false) {
     const emoji = pnlSol >= 0 ? "✅" : "🔻";
     sendTelegram(
       `${emoji} <b>PAPER SELL</b> (${reason})\n\n<code>${pos.mint}</code>\n` +
-      `${(+mult.toFixed(3))}x · ${pnlSol >= 0 ? "+" : ""}${+pnlSol.toFixed(4)} SOL · held ${heldMin}m\n\n` +
+      `${(+mult.toFixed(3))}x (peak ${peakMult}x) · ${pnlSol >= 0 ? "+" : ""}${+pnlSol.toFixed(4)} SOL · held ${heldMin}m\n\n` +
       `Book: ${s.totalPnlSol >= 0 ? "+" : ""}${s.totalPnlSol} SOL (£${s.totalPnlGbp}) · ${s.winRate}% wins · ${s.closed} trades`
     );
   }
@@ -489,7 +483,25 @@ setInterval(async () => {
   }
 }, CONFIG.SETTLE_INTERVAL_MS);
 
-/* sweep: corpse cut + timeout + peak + balance + housekeeping */
+/* FAST loop (15s): peaks + trailing stop */
+setInterval(async () => {
+  for (const [mint, pos] of [...openPositions]) {
+    const px = await fetchPriceSol(mint);
+    if (!px) continue;
+    if (px > pos.peakPrice) pos.peakPrice = px;
+
+    if (!pos.trailArmed && pos.peakPrice >= pos.entryPrice * CONFIG.TRAIL_ARM) {
+      pos.trailArmed = true;
+      console.log(`TRAIL ARMED ${mint} at peak ${(pos.peakPrice / pos.entryPrice).toFixed(2)}x`);
+    }
+    if (pos.trailArmed && px <= pos.peakPrice * (1 - CONFIG.TRAIL_RETRACE)) {
+      await closePosition(mint, "trail stop");
+      if (liveOpen.has(mint)) liveSell(mint, "trail stop");
+    }
+  }
+}, 15_000);
+
+/* slow sweep (60s): corpse cut + timeout + balance + housekeeping */
 setInterval(async () => {
   const tNow = now();
   const holdCutoff = tNow - CONFIG.MAX_HOLD_MIN * 60;
@@ -510,7 +522,6 @@ setInterval(async () => {
       if (liveOpen.has(mint)) liveSell(mint, "timeout");
     }
   }
-  /* live positions with no paper twin still get the timeout */
   for (const [mint, pos] of [...liveOpen]) {
     if (pos.status === "open" && pos.openedAt < holdCutoff && !openPositions.has(mint)) {
       liveSell(mint, "timeout");
@@ -537,26 +548,27 @@ function extractBuy(tx, wallet) {
   const nativeSpent = (tx.nativeTransfers || [])
     .filter((t) => t.fromUserAccount === wallet)
     .reduce((s, t) => s + Number(t.amount || 0), 0);
+  const wsolSpent = transfers
+    .filter((t) => t.fromUserAccount === wallet && t.mint === SOL_MINT)
+    .reduce((s, t) => s + Number(t.tokenAmount || 0), 0);
   const paidNative = nativeSpent > 1_000_000;
   const paidToken = transfers.some(
     (t) => t.fromUserAccount === wallet && QUOTE_MINTS.has(t.mint)
   );
   const paid = paidNative || paidToken;
-  const sizeSol = nativeSpent / LAMPORTS;
+  const swap = tx.events && tx.events.swap;
+  const swapNative = swap ? Number(swap.nativeInput?.amount || 0) / LAMPORTS : 0;
+  const sizeSol = Math.max(nativeSpent / LAMPORTS, wsolSpent, swapNative);
 
   const direct = transfers.find(
     (t) => t.toUserAccount === wallet && t.mint && !QUOTE_MINTS.has(t.mint)
   );
   if (direct && paid) return { mint: direct.mint, sizeSol };
 
-  const swap = tx.events && tx.events.swap;
   if (swap && tx.feePayer === wallet) {
     const outs = (swap.tokenOutputs || []).filter((o) => o.mint && !QUOTE_MINTS.has(o.mint));
     const soldNonQuote = (swap.tokenInputs || []).some((i) => i.mint && !QUOTE_MINTS.has(i.mint));
-    if (outs.length && !soldNonQuote) {
-      const swapIn = Number(swap.nativeInput?.amount || 0) / LAMPORTS;
-      return { mint: outs[0].mint, sizeSol: swapIn || sizeSol };
-    }
+    if (outs.length && !soldNonQuote) return { mint: outs[0].mint, sizeSol };
   }
 
   if (tx.feePayer === wallet && paid) {
@@ -641,7 +653,7 @@ function renderPage() {
 
   let liveBanner;
   if (liveArmed && night) {
-    liveBanner = `<div class="banner ready">🌙 LIVE armed but PAUSED — night window ${CONFIG.NIGHT_START}:00-${CONFIG.NIGHT_END}:00 UK. No new live buys; open positions still managed. Paper continues.</div>`;
+    liveBanner = `<div class="banner ready">🌙 LIVE armed but PAUSED — night window ${CONFIG.NIGHT_START}:00-${CONFIG.NIGHT_END}:00 UK. Paper continues.</div>`;
   } else if (liveArmed) {
     liveBanner = `<div class="banner armed">🔴 LIVE ARMED — ${CONFIG.LIVE_POSITION_SOL} SOL/trade real money · day ${ls.dayPnl >= 0 ? "+" : ""}${ls.dayPnl} SOL · cap −${CONFIG.LIVE_MAX_DAILY_LOSS} · floor ${CONFIG.LIVE_MIN_WALLET} · wallet ${walletSol === null ? "?" : walletSol.toFixed(3)} SOL (${esc(short(liveWallet.publicKey))})</div>`;
   } else if (liveReady()) {
@@ -657,7 +669,7 @@ function renderPage() {
   const openRows = [...openPositions.values()].map((p) => {
     const peakX = (p.peakPrice / p.entryPrice).toFixed(2);
     return `<li class="row open"><div class="body">
-      <div class="head"><span class="sym">${esc(short(p.mint))}</span><span class="x">peak ${peakX}x</span></div>
+      <div class="head"><span class="sym">${esc(short(p.mint))}</span><span class="x">peak ${peakX}x${p.trailArmed ? " · 🎯 trail armed" : ""}</span></div>
       <div class="meta">opened ${fmtAgo(p.openedAt)} · gap ${p.gap}s${fhpcTag(p.fhpcSize)} · ${CONFIG.POSITION_SOL} SOL in</div>
       <div class="meta mono">${esc(p.mint)}</div>
     </div></li>`;
@@ -688,7 +700,7 @@ function renderPage() {
   const tradeRows = [...closedTrades].reverse().slice(0, 60).map((t) => {
     const cls = t.unpriced ? "flat" : t.pnlSol >= 0 ? "win" : "loss";
     const headline = t.unpriced ? "unpriced · excluded"
-      : `${t.mult}x · ${t.pnlSol >= 0 ? "+" : ""}${t.pnlSol} SOL`;
+      : `${t.mult}x (pk ${t.peakMult || "?"}x) · ${t.pnlSol >= 0 ? "+" : ""}${t.pnlSol} SOL`;
     return `<li class="row ${cls}"><div class="body">
       <div class="head"><span class="sym">${esc(short(t.mint))}</span><span class="x">${headline}</span></div>
       <div class="meta">${fmtAgo(t.closedAt)} · held ${t.heldMin}m · ${esc(t.reason)}${fhpcTag(t.fhpcSize)}</div>
@@ -741,8 +753,8 @@ function renderPage() {
 </style></head><body>
   <h1>Confluence <em>trader</em></h1>
   <div class="sub">
-    v4 · ${CONFIG.WATCH_WALLETS.map((w) => esc(short(w))).join(" + ")} ·
-    paper ${CONFIG.POSITION_SOL} SOL/trade · exit on their sell, corpse cut (≤${CONFIG.CORPSE_MULT}x @ ${CONFIG.CORPSE_MIN}m) or ${CONFIG.MAX_HOLD_MIN}m ·
+    v4.1 · ${CONFIG.WATCH_WALLETS.map((w) => esc(short(w))).join(" + ")} ·
+    paper ${CONFIG.POSITION_SOL} SOL/trade · exits: their sell · trail (arm ${CONFIG.TRAIL_ARM}x, −${CONFIG.TRAIL_RETRACE * 100}% off peak) · corpse (≤${CONFIG.CORPSE_MULT}x @ ${CONFIG.CORPSE_MIN}m) · ${CONFIG.MAX_HOLD_MIN}m max ·
     night pause ${CONFIG.NIGHT_START}:00-${CONFIG.NIGHT_END}:00 UK ·
     ${webhookHits} webhook hits · ${CONFIG.TG_TOKEN ? "telegram ✓" : "TELEGRAM NOT SET"}
   </div>
@@ -760,7 +772,7 @@ function renderPage() {
   ${liveOpenRows ? `<ul>${liveOpenRows}</ul>` : ""}
   ${liveTradeRows ? `<ul>${liveTradeRows}</ul>` : `<div class="none">No live trades yet.</div>`}
   ` : ""}
-  <h2>Paper book (v4 rules)</h2>
+  <h2>Paper book (v4.1 rules)</h2>
   <div class="cards">
     <div class="card"><b style="color:${s.totalPnlSol >= 0 ? "var(--cyan)" : "var(--clay)"}">${s.totalPnlSol >= 0 ? "+" : ""}${s.totalPnlSol}</b><span>P&amp;L SOL</span></div>
     <div class="card"><b style="color:${s.totalPnlGbp >= 0 ? "var(--cyan)" : "var(--clay)"}">£${s.totalPnlGbp}</b><span>P&amp;L GBP</span></div>
@@ -806,13 +818,13 @@ const server = http.createServer((req, res) => {
     if (!liveReady()) { res.writeHead(400); return res.end("live engine not configured — check wallet / JUPITER_API_KEY / HELIUS_API_KEY"); }
     rolloverLiveDay();
     liveArmed = true; disarmReason = "";
-    sendTelegram(`🔴 <b>LIVE ARMED</b> — ${CONFIG.LIVE_POSITION_SOL} SOL/trade, max ${CONFIG.LIVE_MAX_OPEN} open, daily cap −${CONFIG.LIVE_MAX_DAILY_LOSS} SOL, floor ${CONFIG.LIVE_MIN_WALLET} SOL, night pause ${CONFIG.NIGHT_START}:00-${CONFIG.NIGHT_END}:00 UK.`);
+    sendTelegram(`🔴 <b>LIVE ARMED</b> — ${CONFIG.LIVE_POSITION_SOL} SOL/trade, max ${CONFIG.LIVE_MAX_OPEN} open, cap −${CONFIG.LIVE_MAX_DAILY_LOSS}, floor ${CONFIG.LIVE_MIN_WALLET}, trail ${CONFIG.TRAIL_ARM}x/−${CONFIG.TRAIL_RETRACE * 100}%, night ${CONFIG.NIGHT_START}-${CONFIG.NIGHT_END} UK.`);
     res.writeHead(200); return res.end("LIVE ARMED. /stop?key=... to disarm.");
   }
   if (path === "/stop") {
     if (CONFIG.CONTROL_KEY && !keyOk) { res.writeHead(403); return res.end("bad key"); }
     disarm("stopped via /stop");
-    res.writeHead(200); return res.end("LIVE DISARMED. Paper continues. Open live positions will still be closed on signals/corpse cut/timeout.");
+    res.writeHead(200); return res.end("LIVE DISARMED. Paper continues.");
   }
   if (path === "/clear-stuck") {
     if (!keyOk) { res.writeHead(403); return res.end("bad key"); }
@@ -839,7 +851,7 @@ const server = http.createServer((req, res) => {
 });
 
 server.listen(CONFIG.PORT, () => {
-  console.log(`Confluence trader v4 on ${CONFIG.PORT} — live ${liveArmed ? "ARMED" : "disarmed"}, ready=${liveReady()}, night=${nightWindow()}`);
+  console.log(`Confluence trader v4.1 on ${CONFIG.PORT} — live ${liveArmed ? "ARMED" : "disarmed"}, ready=${liveReady()}, night=${nightWindow()}`);
   if (CONFIG.WATCH_WALLETS.length < 2) console.warn("WARNING: fewer than 2 wallets — confluence can never fire.");
   if (liveWalletError) console.warn(liveWalletError);
 });
