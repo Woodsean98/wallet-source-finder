@@ -1,13 +1,17 @@
 /**
- * CONFLUENCE TRADER v4.6
+ * CONFLUENCE TRADER v4.7
  * ----------------------
- * v4.4 +
- *  - NO-MOMENTUM CUT: never reached 1.05x AND below 0.85x after 2m -> sold
- *  - MICRO-TRAIL: peak >=1.05x -> sell 15% off peak; big trail (1.5x/-30%)
- *    takes over once peak >=1.5x
- *  - /debug?key=CONTROL_KEY -> last 5 raw FHpc webhook txs (to fix size capture)
- * Env (new): NOMO_MIN(2) NOMO_PEAK_MULT(1.05) NOMO_EXIT_MULT(0.85)
- *            MICRO_TRAIL_ARM(1.05) MICRO_TRAIL_RETRACE_PCT(15)
+ * v4.6 + FIXED FHpc BUY-SIZE CAPTURE (from real /debug payloads):
+ *  - FHpc trades through a proxy wallet (he is feePayer only; the SOL
+ *    moves as wrapped SOL under AEF2...486V), so reading his own
+ *    balance gave fees, not trade size.
+ *  - txSizeSol() now checks, in order: his native SOL out, his wSOL out,
+ *    events.swap.nativeInput, events.swap wSOL tokenInputs, then (when
+ *    he is feePayer) the biggest wSOL transfer in the tx, then
+ *    accountData wSOL balance changes.
+ *  - /debug entries now include "parsedSize" so the fix is verifiable.
+ * Everything else identical to v4.6 (no-momo, micro-trail, night pause,
+ * corpse cut, runner backstop, split slippage, signal monitor).
  */
 
 import http from "http";
@@ -179,7 +183,7 @@ const settling = new Map();
 const closedTrades = [];
 const recentBuys = [];
 let webhookHits = 0;
-const fhpcDebug = [];
+const fhpcDebug = [];   // last 5 raw FHpc txs (+ parsedSize)
 
 const liveOpen = new Map();
 const liveClosed = [];
@@ -326,7 +330,7 @@ function disarm(reason) {
   if (!liveArmed) return;
   liveArmed = false;
   disarmReason = reason;
-  sendTelegram(`🛑 <b>LIVE DISARMED</b> — ${reason}.`);
+  sendTelegram(`🛑 <b>LIVE DISARMED</b> — ${reason}. Signal monitor continues.`);
   console.log(`LIVE DISARMED: ${reason}`);
 }
 
@@ -340,7 +344,7 @@ async function liveBuy(mint, gap, fhpcSize) {
   if (!liveArmed) return;
   if (nightWindow()) { console.log(`LIVE skip ${mint} — night window`); return; }
   if (liveOpen.size >= CONFIG.LIVE_MAX_OPEN) {
-    console.log(`LIVE skip ${mint} — max open`);
+    console.log(`LIVE skip ${mint} — ${liveOpen.size} positions already open`);
     return;
   }
   const rawIn = Math.round(CONFIG.LIVE_POSITION_SOL * LAMPORTS);
@@ -357,10 +361,10 @@ async function liveBuy(mint, gap, fhpcSize) {
     });
     sendTelegram(
       `🔴 <b>LIVE BUY</b> ${solIn.toFixed(4)} SOL\n\n<code>${mint}</code>\n` +
-      `gap ${gap}s · FHpc ${fhpcSize ? fhpcSize.toFixed(3) : "?"}\n🔎 solscan.io/tx/${exec.signature || ""}`
+      `gap ${gap}s · FHpc in ${fhpcSize ? fhpcSize.toFixed(3) : "?"} SOL\n📊 dexscreener.com/solana/${mint}\n🔎 solscan.io/tx/${exec.signature || ""}`
     );
   } catch (e) {
-    sendTelegram(`⚠️ <b>LIVE BUY FAILED</b>\n<code>${mint}</code>\n${e.message}`);
+    sendTelegram(`⚠️ <b>LIVE BUY FAILED</b>\n<code>${mint}</code>\n${e.message}\nNo position opened.`);
     console.error(`LIVE BUY FAILED ${mint}: ${e.message}`);
   }
 }
@@ -392,8 +396,8 @@ async function liveSell(mint, reason, attempt = 1) {
     const emoji = pnlSol >= 0 ? "✅" : "🔻";
     sendTelegram(
       `${emoji} <b>LIVE SELL</b> (${reason})\n\n<code>${mint}</code>\n` +
-      `${mult}x (pk ${(pos.livePeakMult || 1).toFixed(2)}x) · ${pnlSol >= 0 ? "+" : ""}${pnlSol} SOL\n` +
-      `Day: ${liveDayPnl >= 0 ? "+" : ""}${liveDayPnl.toFixed(4)} SOL`
+      `${mult}x (peak ${(pos.livePeakMult || 1).toFixed(2)}x) · ${pnlSol >= 0 ? "+" : ""}${pnlSol} SOL\n` +
+      `Day: ${liveDayPnl >= 0 ? "+" : ""}${liveDayPnl.toFixed(4)} SOL\n🔎 solscan.io/tx/${exec.signature || ""}`
     );
 
     if (liveDayPnl <= -CONFIG.LIVE_MAX_DAILY_LOSS) {
@@ -408,7 +412,8 @@ async function liveSell(mint, reason, attempt = 1) {
     }
     pos.status = "stuck";
     sendTelegram(
-      `🚨 <b>LIVE POSITION STUCK</b>\n<code>${mint}</code>\n${e.message}\nSell manually, then /clear-stuck?key=…&mint=${mint}`
+      `🚨 <b>LIVE POSITION STUCK</b>\n<code>${mint}</code>\n` +
+      `Sell failed 4x: ${e.message}\nSell it manually, then /clear-stuck?key=…&mint=${mint}`
     );
   }
 }
@@ -492,14 +497,7 @@ setInterval(async () => {
   }
 }, CONFIG.SETTLE_INTERVAL_MS);
 
-/* trail band helper: returns retrace band for a given peak multiple, or null */
-function trailBand(peakMult) {
-  if (peakMult >= CONFIG.TRAIL_ARM) return { band: CONFIG.TRAIL_RETRACE, reason: "trail stop" };
-  if (peakMult >= CONFIG.MICRO_ARM) return { band: CONFIG.MICRO_RETRACE, reason: "micro trail" };
-  return null;
-}
-
-/* FAST loop (15s): peaks + trails + no-momentum cut */
+/* FAST loop (15s): peaks + big trail + micro-trail + no-momentum cut */
 setInterval(async () => {
   const tNow = now();
   const nomoCutoff = tNow - CONFIG.NOMO_MIN * 60;
@@ -510,12 +508,18 @@ setInterval(async () => {
     if (px > pos.peakPrice) pos.peakPrice = px;
     const peakMult = pos.peakPrice / pos.entryPrice;
     const curMult = px / pos.entryPrice;
+
     if (!pos.trailArmed && peakMult >= CONFIG.TRAIL_ARM) pos.trailArmed = true;
 
-    const tb = trailBand(peakMult);
-    if (tb && px <= pos.peakPrice * (1 - tb.band)) {
-      await closePosition(mint, tb.reason);
-      if (liveOpen.has(mint)) liveSell(mint, tb.reason);
+    if (pos.trailArmed && px <= pos.peakPrice * (1 - CONFIG.TRAIL_RETRACE)) {
+      await closePosition(mint, "trail stop");
+      if (liveOpen.has(mint)) liveSell(mint, "trail stop");
+      continue;
+    }
+    if (!pos.trailArmed && peakMult >= CONFIG.MICRO_ARM &&
+        px <= pos.peakPrice * (1 - CONFIG.MICRO_RETRACE)) {
+      await closePosition(mint, "micro trail");
+      if (liveOpen.has(mint)) liveSell(mint, "micro trail");
       continue;
     }
     if (peakMult < CONFIG.NOMO_PEAK && curMult < CONFIG.NOMO_EXIT && pos.openedAt < nomoCutoff) {
@@ -532,10 +536,14 @@ setInterval(async () => {
     if (m > pos.livePeakMult) pos.livePeakMult = m;
     if (!pos.liveTrailArmed && pos.livePeakMult >= CONFIG.TRAIL_ARM) pos.liveTrailArmed = true;
 
+    if (pos.liveTrailArmed && m <= pos.livePeakMult * (1 - CONFIG.TRAIL_RETRACE)) {
+      liveSell(mint, "trail stop");
+      continue;
+    }
     if (!openPositions.has(mint)) {
-      const tb = trailBand(pos.livePeakMult);
-      if (tb && m <= pos.livePeakMult * (1 - tb.band)) {
-        liveSell(mint, tb.reason);
+      if (!pos.liveTrailArmed && pos.livePeakMult >= CONFIG.MICRO_ARM &&
+          m <= pos.livePeakMult * (1 - CONFIG.MICRO_RETRACE)) {
+        liveSell(mint, "micro trail");
         continue;
       }
       if (pos.livePeakMult < CONFIG.NOMO_PEAK && m < CONFIG.NOMO_EXIT && pos.openedAt < nomoCutoff) {
@@ -594,22 +602,85 @@ setInterval(async () => {
 
 /* ── webhook handling ───────────────────────────────────── */
 
+/**
+ * THE FIX. How much SOL did this wallet actually put into this tx?
+ * FHpc routes through a proxy wallet and pays in wrapped SOL, so we
+ * check every representation Helius uses, biggest wins:
+ *  1. native SOL sent from the wallet itself
+ *  2. wSOL sent from the wallet itself
+ *  3. events.swap.nativeInput (lamports)
+ *  4. events.swap.tokenInputs where mint is wSOL (rawTokenAmount)
+ *  5. if wallet is feePayer: biggest single wSOL tokenTransfer in the tx
+ *  6. if wallet is feePayer: biggest wSOL balance change in accountData
+ */
+function txSizeSol(tx, wallet) {
+  const transfers = tx.tokenTransfers || [];
+  const swap = tx.events && tx.events.swap;
+  const cands = [0];
+
+  const nativeSpent = (tx.nativeTransfers || [])
+    .filter((t) => t.fromUserAccount === wallet)
+    .reduce((s, t) => s + Number(t.amount || 0), 0);
+  cands.push(nativeSpent / LAMPORTS);
+
+  cands.push(transfers
+    .filter((t) => t.fromUserAccount === wallet && t.mint === SOL_MINT)
+    .reduce((s, t) => s + Math.abs(Number(t.tokenAmount || 0)), 0));
+
+  if (swap) {
+    cands.push(Number(swap.nativeInput?.amount || 0) / LAMPORTS);
+    let wsolIn = 0;
+    for (const i of swap.tokenInputs || []) {
+      if (i.mint !== SOL_MINT) continue;
+      const r = i.rawTokenAmount;
+      if (r && r.tokenAmount != null) {
+        wsolIn += Math.abs(Number(r.tokenAmount)) / Math.pow(10, Number(r.decimals ?? 9));
+      } else if (i.tokenAmount != null) {
+        wsolIn += Math.abs(Number(i.tokenAmount));
+      }
+    }
+    cands.push(wsolIn);
+  }
+
+  if (tx.feePayer === wallet) {
+    let biggest = 0;
+    for (const t of transfers) {
+      if (t.mint !== SOL_MINT) continue;
+      const a = Math.abs(Number(t.tokenAmount || 0));
+      if (a > biggest) biggest = a;
+    }
+    cands.push(biggest);
+
+    let adWsol = 0;
+    for (const ad of tx.accountData || []) {
+      for (const tb of ad.tokenBalanceChanges || []) {
+        if (tb.mint !== SOL_MINT) continue;
+        const r = tb.rawTokenAmount;
+        const a = r && r.tokenAmount != null
+          ? Math.abs(Number(r.tokenAmount)) / Math.pow(10, Number(r.decimals ?? 9))
+          : 0;
+        if (a > adWsol) adWsol = a;
+      }
+    }
+    cands.push(adWsol);
+  }
+
+  const size = Math.max(...cands.filter((n) => Number.isFinite(n)));
+  return size > 0 ? size : 0;
+}
+
 function extractBuy(tx, wallet) {
   const transfers = tx.tokenTransfers || [];
   const nativeSpent = (tx.nativeTransfers || [])
     .filter((t) => t.fromUserAccount === wallet)
     .reduce((s, t) => s + Number(t.amount || 0), 0);
-  const wsolSpent = transfers
-    .filter((t) => t.fromUserAccount === wallet && t.mint === SOL_MINT)
-    .reduce((s, t) => s + Number(t.tokenAmount || 0), 0);
   const paidNative = nativeSpent > 1_000_000;
   const paidToken = transfers.some(
     (t) => t.fromUserAccount === wallet && QUOTE_MINTS.has(t.mint)
   );
   const paid = paidNative || paidToken;
   const swap = tx.events && tx.events.swap;
-  const swapNative = swap ? Number(swap.nativeInput?.amount || 0) / LAMPORTS : 0;
-  const sizeSol = Math.max(nativeSpent / LAMPORTS, wsolSpent, swapNative);
+  const sizeSol = txSizeSol(tx, wallet);
 
   const direct = transfers.find(
     (t) => t.toUserAccount === wallet && t.mint && !QUOTE_MINTS.has(t.mint)
@@ -672,10 +743,15 @@ function handleWebhookPayload(payload) {
     if (!tx || !tx.signature) continue;
     const ts = tx.timestamp || now();
 
+    /* debug capture: any tx involving FHpc, with the size the parser saw */
     try {
       const raw = JSON.stringify(tx);
       if (raw.includes(FHPC)) {
-        fhpcDebug.push({ at: new Date().toISOString(), tx });
+        fhpcDebug.push({
+          at: new Date().toISOString(),
+          parsedSize: +txSizeSol(tx, FHPC).toFixed(4),
+          tx,
+        });
         while (fhpcDebug.length > 5) fhpcDebug.shift();
       }
     } catch {}
@@ -713,17 +789,17 @@ function renderPage() {
 
   let liveBanner;
   if (liveArmed && night) {
-    liveBanner = `<div class="banner ready">🌙 LIVE armed but PAUSED — night ${CONFIG.NIGHT_START}:00-${CONFIG.NIGHT_END}:00 UK.</div>`;
+    liveBanner = `<div class="banner ready">🌙 LIVE armed but PAUSED — night window ${CONFIG.NIGHT_START}:00-${CONFIG.NIGHT_END}:00 UK.</div>`;
   } else if (liveArmed) {
-    liveBanner = `<div class="banner armed">🔴 LIVE ARMED — ${CONFIG.LIVE_POSITION_SOL} SOL/trade · day ${ls.dayPnl >= 0 ? "+" : ""}${ls.dayPnl} SOL · cap −${CONFIG.LIVE_MAX_DAILY_LOSS} · floor ${CONFIG.LIVE_MIN_WALLET} · wallet ${walletSol === null ? "?" : walletSol.toFixed(3)} SOL (${esc(short(liveWallet.publicKey))})</div>`;
+    liveBanner = `<div class="banner armed">🔴 LIVE ARMED — ${CONFIG.LIVE_POSITION_SOL} SOL/trade real money · day ${ls.dayPnl >= 0 ? "+" : ""}${ls.dayPnl} SOL · cap −${CONFIG.LIVE_MAX_DAILY_LOSS} · floor ${CONFIG.LIVE_MIN_WALLET} · wallet ${walletSol === null ? "?" : walletSol.toFixed(3)} SOL (${esc(short(liveWallet.publicKey))})</div>`;
   } else if (liveReady()) {
-    liveBanner = `<div class="banner ready">⚪️ Live ready, DISARMED (${esc(disarmReason)}) · wallet ${walletSol === null ? "?" : walletSol.toFixed(3)} SOL (${esc(short(liveWallet.publicKey))}) · /arm?key=…</div>`;
+    liveBanner = `<div class="banner ready">⚪️ Live engine ready, DISARMED (${esc(disarmReason)}) · wallet ${walletSol === null ? "?" : walletSol.toFixed(3)} SOL (${esc(short(liveWallet.publicKey))}) · arm via /arm?key=…</div>`;
   } else {
     const missing = [];
     if (!liveWallet) missing.push(liveWalletError || "WALLET_PRIVATE_KEY or WALLET_SEED_PHRASE");
     if (!CONFIG.JUP_KEY) missing.push("JUPITER_API_KEY");
     if (!RPC) missing.push("HELIUS_API_KEY");
-    liveBanner = `<div class="banner off">⚪️ Live not configured — missing: ${esc(missing.join(", "))}.</div>`;
+    liveBanner = `<div class="banner off">⚪️ Live engine not configured — missing: ${esc(missing.join(", "))}.</div>`;
   }
 
   const liveOpenRows = [...liveOpen.values()].map((p) => {
@@ -818,8 +894,10 @@ function renderPage() {
 </style></head><body>
   <h1>Confluence <em>trader</em></h1>
   <div class="sub">
-    v4.6 · ${CONFIG.WATCH_WALLETS.map((w) => esc(short(w))).join(" + ")} ·
-    exits: their sell · trail ${CONFIG.TRAIL_ARM}x/−${CONFIG.TRAIL_RETRACE * 100}% · micro ${CONFIG.MICRO_ARM}x/−${CONFIG.MICRO_RETRACE * 100}% · no-momo (<${CONFIG.NOMO_PEAK}x pk & <${CONFIG.NOMO_EXIT}x @ ${CONFIG.NOMO_MIN}m) · corpse ≤${CONFIG.CORPSE_MULT}x @ ${CONFIG.CORPSE_MIN}m · ${CONFIG.MAX_HOLD_MIN}m max (runners ${CONFIG.TRAIL_MAX_HOLD_MIN}m) ·
+    v4.7 · ${CONFIG.WATCH_WALLETS.map((w) => esc(short(w))).join(" + ")} ·
+    exits: their sell · trail ${CONFIG.TRAIL_ARM}x/−${CONFIG.TRAIL_RETRACE * 100}% · micro ${CONFIG.MICRO_ARM}x/−${CONFIG.MICRO_RETRACE * 100}% · no-momo &lt;${CONFIG.NOMO_PEAK}x@${CONFIG.NOMO_MIN}m · corpse ≤${CONFIG.CORPSE_MULT}x@${CONFIG.CORPSE_MIN}m · ${CONFIG.MAX_HOLD_MIN}m max (runners ${CONFIG.TRAIL_MAX_HOLD_MIN}m) ·
+    size capture v2 ·
+    live slip ${CONFIG.LIVE_BUY_SLIP * 100}/${CONFIG.LIVE_SELL_SLIP * 100}% ·
     night ${CONFIG.NIGHT_START}:00-${CONFIG.NIGHT_END}:00 UK ·
     ${webhookHits} hits · ${CONFIG.TG_TOKEN ? "telegram ✓" : "TELEGRAM NOT SET"}
   </div>
@@ -875,23 +953,23 @@ const server = http.createServer((req, res) => {
   const keyOk = CONFIG.CONTROL_KEY && params.key === CONFIG.CONTROL_KEY;
 
   if (path === "/arm") {
-    if (!keyOk) { res.writeHead(403); return res.end("bad key"); }
-    if (!liveReady()) { res.writeHead(400); return res.end("live not configured"); }
+    if (!keyOk) { res.writeHead(403); return res.end("bad key (CONTROL_KEY must be set and match)"); }
+    if (!liveReady()) { res.writeHead(400); return res.end("live engine not configured — check wallet / JUPITER_API_KEY / HELIUS_API_KEY"); }
     rolloverLiveDay();
     liveArmed = true; disarmReason = "";
-    sendTelegram(`🔴 <b>LIVE ARMED</b> — ${CONFIG.LIVE_POSITION_SOL} SOL/trade, cap −${CONFIG.LIVE_MAX_DAILY_LOSS}, floor ${CONFIG.LIVE_MIN_WALLET}.`);
+    sendTelegram(`🔴 <b>LIVE ARMED</b> — ${CONFIG.LIVE_POSITION_SOL} SOL/trade, max ${CONFIG.LIVE_MAX_OPEN} open, cap −${CONFIG.LIVE_MAX_DAILY_LOSS}, floor ${CONFIG.LIVE_MIN_WALLET}, slip ${CONFIG.LIVE_BUY_SLIP * 100}/${CONFIG.LIVE_SELL_SLIP * 100}%, night ${CONFIG.NIGHT_START}-${CONFIG.NIGHT_END} UK.`);
     res.writeHead(200); return res.end("LIVE ARMED. /stop?key=... to disarm.");
   }
   if (path === "/stop") {
     if (CONFIG.CONTROL_KEY && !keyOk) { res.writeHead(403); return res.end("bad key"); }
     disarm("stopped via /stop");
-    res.writeHead(200); return res.end("LIVE DISARMED.");
+    res.writeHead(200); return res.end("LIVE DISARMED. Signal monitor continues.");
   }
   if (path === "/clear-stuck") {
     if (!keyOk) { res.writeHead(403); return res.end("bad key"); }
     const m = params.mint;
     if (m && liveOpen.has(m)) { liveOpen.delete(m); res.writeHead(200); return res.end(`cleared ${m}`); }
-    res.writeHead(404); return res.end("mint not found");
+    res.writeHead(404); return res.end("mint not found in live positions");
   }
   if (path === "/debug") {
     if (!keyOk) { res.writeHead(403); return res.end("bad key"); }
@@ -917,7 +995,7 @@ const server = http.createServer((req, res) => {
 });
 
 server.listen(CONFIG.PORT, () => {
-  console.log(`Confluence trader v4.6 on ${CONFIG.PORT} — live ${liveArmed ? "ARMED" : "disarmed"}, ready=${liveReady()}`);
+  console.log(`Confluence trader v4.7 on ${CONFIG.PORT} — live ${liveArmed ? "ARMED" : "disarmed"}, ready=${liveReady()}`);
   if (CONFIG.WATCH_WALLETS.length < 2) console.warn("WARNING: fewer than 2 wallets — confluence can never fire.");
   if (liveWalletError) console.warn(liveWalletError);
 });
