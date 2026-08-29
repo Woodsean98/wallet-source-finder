@@ -1,11 +1,13 @@
 /**
- * CONFLUENCE TRADER v4.4
+ * CONFLUENCE TRADER v4.6
  * ----------------------
- * v4.3 + runner-friendly timeout:
- *  - positions whose trail is ARMED (peaked >= TRAIL_ARM x) are exempt
- *    from MAX_HOLD_MIN; they exit on bot sell / trail retrace, with a
- *    long backstop at TRAIL_MAX_HOLD_MIN (default 90m)
- *  - never-armed positions still time out at MAX_HOLD_MIN (30m)
+ * v4.4 +
+ *  - NO-MOMENTUM CUT: never reached 1.05x AND below 0.85x after 2m -> sold
+ *  - MICRO-TRAIL: peak >=1.05x -> sell 15% off peak; big trail (1.5x/-30%)
+ *    takes over once peak >=1.5x
+ *  - /debug?key=CONTROL_KEY -> last 5 raw FHpc webhook txs (to fix size capture)
+ * Env (new): NOMO_MIN(2) NOMO_PEAK_MULT(1.05) NOMO_EXIT_MULT(0.85)
+ *            MICRO_TRAIL_ARM(1.05) MICRO_TRAIL_RETRACE_PCT(15)
  */
 
 import http from "http";
@@ -25,6 +27,11 @@ const CONFIG = {
   TRAIL_MAX_HOLD_MIN: Number(process.env.TRAIL_MAX_HOLD_MIN || 90),
   CORPSE_MIN: Number(process.env.CORPSE_MIN || 10),
   CORPSE_MULT: Number(process.env.CORPSE_MULT || 0.75),
+  NOMO_MIN: Number(process.env.NOMO_MIN || 2),
+  NOMO_PEAK: Number(process.env.NOMO_PEAK_MULT || 1.05),
+  NOMO_EXIT: Number(process.env.NOMO_EXIT_MULT || 0.85),
+  MICRO_ARM: Number(process.env.MICRO_TRAIL_ARM || 1.05),
+  MICRO_RETRACE: Number(process.env.MICRO_TRAIL_RETRACE_PCT || 15) / 100,
   TRAIL_ARM: Number(process.env.TRAIL_ARM_MULT || 1.5),
   TRAIL_RETRACE: Number(process.env.TRAIL_RETRACE_PCT || 30) / 100,
   NIGHT_START: Number(process.env.NIGHT_START_HOUR || 23),
@@ -172,6 +179,7 @@ const settling = new Map();
 const closedTrades = [];
 const recentBuys = [];
 let webhookHits = 0;
+const fhpcDebug = [];
 
 const liveOpen = new Map();
 const liveClosed = [];
@@ -318,7 +326,7 @@ function disarm(reason) {
   if (!liveArmed) return;
   liveArmed = false;
   disarmReason = reason;
-  sendTelegram(`🛑 <b>LIVE DISARMED</b> — ${reason}. Signal monitor continues.`);
+  sendTelegram(`🛑 <b>LIVE DISARMED</b> — ${reason}.`);
   console.log(`LIVE DISARMED: ${reason}`);
 }
 
@@ -332,7 +340,7 @@ async function liveBuy(mint, gap, fhpcSize) {
   if (!liveArmed) return;
   if (nightWindow()) { console.log(`LIVE skip ${mint} — night window`); return; }
   if (liveOpen.size >= CONFIG.LIVE_MAX_OPEN) {
-    console.log(`LIVE skip ${mint} — ${liveOpen.size} positions already open`);
+    console.log(`LIVE skip ${mint} — max open`);
     return;
   }
   const rawIn = Math.round(CONFIG.LIVE_POSITION_SOL * LAMPORTS);
@@ -349,10 +357,10 @@ async function liveBuy(mint, gap, fhpcSize) {
     });
     sendTelegram(
       `🔴 <b>LIVE BUY</b> ${solIn.toFixed(4)} SOL\n\n<code>${mint}</code>\n` +
-      `gap ${gap}s · FHpc in ${fhpcSize ? fhpcSize.toFixed(3) : "?"} SOL\n📊 dexscreener.com/solana/${mint}\n🔎 solscan.io/tx/${exec.signature || ""}`
+      `gap ${gap}s · FHpc ${fhpcSize ? fhpcSize.toFixed(3) : "?"}\n🔎 solscan.io/tx/${exec.signature || ""}`
     );
   } catch (e) {
-    sendTelegram(`⚠️ <b>LIVE BUY FAILED</b>\n<code>${mint}</code>\n${e.message}\nNo position opened.`);
+    sendTelegram(`⚠️ <b>LIVE BUY FAILED</b>\n<code>${mint}</code>\n${e.message}`);
     console.error(`LIVE BUY FAILED ${mint}: ${e.message}`);
   }
 }
@@ -384,8 +392,8 @@ async function liveSell(mint, reason, attempt = 1) {
     const emoji = pnlSol >= 0 ? "✅" : "🔻";
     sendTelegram(
       `${emoji} <b>LIVE SELL</b> (${reason})\n\n<code>${mint}</code>\n` +
-      `${mult}x (peak ${(pos.livePeakMult || 1).toFixed(2)}x) · ${pnlSol >= 0 ? "+" : ""}${pnlSol} SOL\n` +
-      `Day: ${liveDayPnl >= 0 ? "+" : ""}${liveDayPnl.toFixed(4)} SOL\n🔎 solscan.io/tx/${exec.signature || ""}`
+      `${mult}x (pk ${(pos.livePeakMult || 1).toFixed(2)}x) · ${pnlSol >= 0 ? "+" : ""}${pnlSol} SOL\n` +
+      `Day: ${liveDayPnl >= 0 ? "+" : ""}${liveDayPnl.toFixed(4)} SOL`
     );
 
     if (liveDayPnl <= -CONFIG.LIVE_MAX_DAILY_LOSS) {
@@ -400,8 +408,7 @@ async function liveSell(mint, reason, attempt = 1) {
     }
     pos.status = "stuck";
     sendTelegram(
-      `🚨 <b>LIVE POSITION STUCK</b>\n<code>${mint}</code>\n` +
-      `Sell failed 4x: ${e.message}\nSell it manually, then /clear-stuck?key=…&mint=${mint}`
+      `🚨 <b>LIVE POSITION STUCK</b>\n<code>${mint}</code>\n${e.message}\nSell manually, then /clear-stuck?key=…&mint=${mint}`
     );
   }
 }
@@ -485,18 +492,38 @@ setInterval(async () => {
   }
 }, CONFIG.SETTLE_INTERVAL_MS);
 
-/* FAST loop (15s): peaks + trailing stop — paper AND live */
+/* trail band helper: returns retrace band for a given peak multiple, or null */
+function trailBand(peakMult) {
+  if (peakMult >= CONFIG.TRAIL_ARM) return { band: CONFIG.TRAIL_RETRACE, reason: "trail stop" };
+  if (peakMult >= CONFIG.MICRO_ARM) return { band: CONFIG.MICRO_RETRACE, reason: "micro trail" };
+  return null;
+}
+
+/* FAST loop (15s): peaks + trails + no-momentum cut */
 setInterval(async () => {
+  const tNow = now();
+  const nomoCutoff = tNow - CONFIG.NOMO_MIN * 60;
+
   for (const [mint, pos] of [...openPositions]) {
     const px = await fetchPriceSol(mint);
     if (!px) continue;
     if (px > pos.peakPrice) pos.peakPrice = px;
-    if (!pos.trailArmed && pos.peakPrice >= pos.entryPrice * CONFIG.TRAIL_ARM) pos.trailArmed = true;
-    if (pos.trailArmed && px <= pos.peakPrice * (1 - CONFIG.TRAIL_RETRACE)) {
-      await closePosition(mint, "trail stop");
-      if (liveOpen.has(mint)) liveSell(mint, "trail stop");
+    const peakMult = pos.peakPrice / pos.entryPrice;
+    const curMult = px / pos.entryPrice;
+    if (!pos.trailArmed && peakMult >= CONFIG.TRAIL_ARM) pos.trailArmed = true;
+
+    const tb = trailBand(peakMult);
+    if (tb && px <= pos.peakPrice * (1 - tb.band)) {
+      await closePosition(mint, tb.reason);
+      if (liveOpen.has(mint)) liveSell(mint, tb.reason);
+      continue;
+    }
+    if (peakMult < CONFIG.NOMO_PEAK && curMult < CONFIG.NOMO_EXIT && pos.openedAt < nomoCutoff) {
+      await closePosition(mint, "no-momentum cut");
+      if (liveOpen.has(mint)) liveSell(mint, "no-momentum cut");
     }
   }
+
   for (const [mint, pos] of [...liveOpen]) {
     if (pos.status !== "open") continue;
     const px = await fetchPriceSol(mint);
@@ -504,8 +531,16 @@ setInterval(async () => {
     if (m === null) continue;
     if (m > pos.livePeakMult) pos.livePeakMult = m;
     if (!pos.liveTrailArmed && pos.livePeakMult >= CONFIG.TRAIL_ARM) pos.liveTrailArmed = true;
-    if (pos.liveTrailArmed && m <= pos.livePeakMult * (1 - CONFIG.TRAIL_RETRACE)) {
-      liveSell(mint, "trail stop");
+
+    if (!openPositions.has(mint)) {
+      const tb = trailBand(pos.livePeakMult);
+      if (tb && m <= pos.livePeakMult * (1 - tb.band)) {
+        liveSell(mint, tb.reason);
+        continue;
+      }
+      if (pos.livePeakMult < CONFIG.NOMO_PEAK && m < CONFIG.NOMO_EXIT && pos.openedAt < nomoCutoff) {
+        liveSell(mint, "no-momentum cut");
+      }
     }
   }
 }, 15_000);
@@ -636,6 +671,15 @@ function handleWebhookPayload(payload) {
   for (const tx of txs) {
     if (!tx || !tx.signature) continue;
     const ts = tx.timestamp || now();
+
+    try {
+      const raw = JSON.stringify(tx);
+      if (raw.includes(FHPC)) {
+        fhpcDebug.push({ at: new Date().toISOString(), tx });
+        while (fhpcDebug.length > 5) fhpcDebug.shift();
+      }
+    } catch {}
+
     for (const wallet of CONFIG.WATCH_WALLETS) {
       const buy = extractBuy(tx, wallet);
       if (buy) { recordBuy(wallet, buy.mint, ts, buy.sizeSol || 0); continue; }
@@ -669,17 +713,17 @@ function renderPage() {
 
   let liveBanner;
   if (liveArmed && night) {
-    liveBanner = `<div class="banner ready">🌙 LIVE armed but PAUSED — night window ${CONFIG.NIGHT_START}:00-${CONFIG.NIGHT_END}:00 UK. Signal monitor continues.</div>`;
+    liveBanner = `<div class="banner ready">🌙 LIVE armed but PAUSED — night ${CONFIG.NIGHT_START}:00-${CONFIG.NIGHT_END}:00 UK.</div>`;
   } else if (liveArmed) {
-    liveBanner = `<div class="banner armed">🔴 LIVE ARMED — ${CONFIG.LIVE_POSITION_SOL} SOL/trade real money · day ${ls.dayPnl >= 0 ? "+" : ""}${ls.dayPnl} SOL · cap −${CONFIG.LIVE_MAX_DAILY_LOSS} · floor ${CONFIG.LIVE_MIN_WALLET} · wallet ${walletSol === null ? "?" : walletSol.toFixed(3)} SOL (${esc(short(liveWallet.publicKey))})</div>`;
+    liveBanner = `<div class="banner armed">🔴 LIVE ARMED — ${CONFIG.LIVE_POSITION_SOL} SOL/trade · day ${ls.dayPnl >= 0 ? "+" : ""}${ls.dayPnl} SOL · cap −${CONFIG.LIVE_MAX_DAILY_LOSS} · floor ${CONFIG.LIVE_MIN_WALLET} · wallet ${walletSol === null ? "?" : walletSol.toFixed(3)} SOL (${esc(short(liveWallet.publicKey))})</div>`;
   } else if (liveReady()) {
-    liveBanner = `<div class="banner ready">⚪️ Live engine ready, DISARMED (${esc(disarmReason)}) · wallet ${walletSol === null ? "?" : walletSol.toFixed(3)} SOL (${esc(short(liveWallet.publicKey))}) · arm via /arm?key=…</div>`;
+    liveBanner = `<div class="banner ready">⚪️ Live ready, DISARMED (${esc(disarmReason)}) · wallet ${walletSol === null ? "?" : walletSol.toFixed(3)} SOL (${esc(short(liveWallet.publicKey))}) · /arm?key=…</div>`;
   } else {
     const missing = [];
     if (!liveWallet) missing.push(liveWalletError || "WALLET_PRIVATE_KEY or WALLET_SEED_PHRASE");
     if (!CONFIG.JUP_KEY) missing.push("JUPITER_API_KEY");
     if (!RPC) missing.push("HELIUS_API_KEY");
-    liveBanner = `<div class="banner off">⚪️ Live engine not configured — missing: ${esc(missing.join(", "))}. Signal monitor only.</div>`;
+    liveBanner = `<div class="banner off">⚪️ Live not configured — missing: ${esc(missing.join(", "))}.</div>`;
   }
 
   const liveOpenRows = [...liveOpen.values()].map((p) => {
@@ -719,8 +763,7 @@ function renderPage() {
 
   const tradeRows = [...closedTrades].reverse().slice(0, 40).map((t) => {
     const cls = t.unpriced ? "flat" : t.pnlSol >= 0 ? "win" : "loss";
-    const headline = t.unpriced ? "unpriced"
-      : `${t.mult}x (pk ${t.peakMult || "?"}x)`;
+    const headline = t.unpriced ? "unpriced" : `${t.mult}x (pk ${t.peakMult || "?"}x)`;
     return `<li class="row ${cls} muted"><div class="body">
       <div class="head"><span class="sym">${esc(short(t.mint))}</span><span class="x">${headline}</span></div>
       <div class="meta">${fmtAgo(t.closedAt)} · held ${t.heldMin}m · ${esc(t.reason)}${fhpcTag(t.fhpcSize)}</div>
@@ -775,9 +818,8 @@ function renderPage() {
 </style></head><body>
   <h1>Confluence <em>trader</em></h1>
   <div class="sub">
-    v4.4 · ${CONFIG.WATCH_WALLETS.map((w) => esc(short(w))).join(" + ")} ·
-    exits: their sell · trail (arm ${CONFIG.TRAIL_ARM}x, −${CONFIG.TRAIL_RETRACE * 100}%) · corpse (≤${CONFIG.CORPSE_MULT}x @ ${CONFIG.CORPSE_MIN}m) · ${CONFIG.MAX_HOLD_MIN}m max (runners ${CONFIG.TRAIL_MAX_HOLD_MIN}m) ·
-    live slip ${CONFIG.LIVE_BUY_SLIP * 100}/${CONFIG.LIVE_SELL_SLIP * 100}% ·
+    v4.6 · ${CONFIG.WATCH_WALLETS.map((w) => esc(short(w))).join(" + ")} ·
+    exits: their sell · trail ${CONFIG.TRAIL_ARM}x/−${CONFIG.TRAIL_RETRACE * 100}% · micro ${CONFIG.MICRO_ARM}x/−${CONFIG.MICRO_RETRACE * 100}% · no-momo (<${CONFIG.NOMO_PEAK}x pk & <${CONFIG.NOMO_EXIT}x @ ${CONFIG.NOMO_MIN}m) · corpse ≤${CONFIG.CORPSE_MULT}x @ ${CONFIG.CORPSE_MIN}m · ${CONFIG.MAX_HOLD_MIN}m max (runners ${CONFIG.TRAIL_MAX_HOLD_MIN}m) ·
     night ${CONFIG.NIGHT_START}:00-${CONFIG.NIGHT_END}:00 UK ·
     ${webhookHits} hits · ${CONFIG.TG_TOKEN ? "telegram ✓" : "TELEGRAM NOT SET"}
   </div>
@@ -833,23 +875,28 @@ const server = http.createServer((req, res) => {
   const keyOk = CONFIG.CONTROL_KEY && params.key === CONFIG.CONTROL_KEY;
 
   if (path === "/arm") {
-    if (!keyOk) { res.writeHead(403); return res.end("bad key (CONTROL_KEY must be set and match)"); }
-    if (!liveReady()) { res.writeHead(400); return res.end("live engine not configured — check wallet / JUPITER_API_KEY / HELIUS_API_KEY"); }
+    if (!keyOk) { res.writeHead(403); return res.end("bad key"); }
+    if (!liveReady()) { res.writeHead(400); return res.end("live not configured"); }
     rolloverLiveDay();
     liveArmed = true; disarmReason = "";
-    sendTelegram(`🔴 <b>LIVE ARMED</b> — ${CONFIG.LIVE_POSITION_SOL} SOL/trade, max ${CONFIG.LIVE_MAX_OPEN} open, cap −${CONFIG.LIVE_MAX_DAILY_LOSS}, floor ${CONFIG.LIVE_MIN_WALLET}, runners to ${CONFIG.TRAIL_MAX_HOLD_MIN}m.`);
+    sendTelegram(`🔴 <b>LIVE ARMED</b> — ${CONFIG.LIVE_POSITION_SOL} SOL/trade, cap −${CONFIG.LIVE_MAX_DAILY_LOSS}, floor ${CONFIG.LIVE_MIN_WALLET}.`);
     res.writeHead(200); return res.end("LIVE ARMED. /stop?key=... to disarm.");
   }
   if (path === "/stop") {
     if (CONFIG.CONTROL_KEY && !keyOk) { res.writeHead(403); return res.end("bad key"); }
     disarm("stopped via /stop");
-    res.writeHead(200); return res.end("LIVE DISARMED. Signal monitor continues.");
+    res.writeHead(200); return res.end("LIVE DISARMED.");
   }
   if (path === "/clear-stuck") {
     if (!keyOk) { res.writeHead(403); return res.end("bad key"); }
     const m = params.mint;
     if (m && liveOpen.has(m)) { liveOpen.delete(m); res.writeHead(200); return res.end(`cleared ${m}`); }
-    res.writeHead(404); return res.end("mint not found in live positions");
+    res.writeHead(404); return res.end("mint not found");
+  }
+  if (path === "/debug") {
+    if (!keyOk) { res.writeHead(403); return res.end("bad key"); }
+    res.writeHead(200, { "Content-Type": "application/json" });
+    return res.end(JSON.stringify({ count: fhpcDebug.length, txs: fhpcDebug }, null, 2));
   }
 
   if (path === "/health") { res.writeHead(200); return res.end("ok"); }
@@ -870,7 +917,7 @@ const server = http.createServer((req, res) => {
 });
 
 server.listen(CONFIG.PORT, () => {
-  console.log(`Confluence trader v4.4 on ${CONFIG.PORT} — live ${liveArmed ? "ARMED" : "disarmed"}, ready=${liveReady()}`);
+  console.log(`Confluence trader v4.6 on ${CONFIG.PORT} — live ${liveArmed ? "ARMED" : "disarmed"}, ready=${liveReady()}`);
   if (CONFIG.WATCH_WALLETS.length < 2) console.warn("WARNING: fewer than 2 wallets — confluence can never fire.");
   if (liveWalletError) console.warn(liveWalletError);
 });
