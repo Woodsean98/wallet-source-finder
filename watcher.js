@@ -1,12 +1,11 @@
 /**
- * CONFLUENCE TRADER v4.3
+ * CONFLUENCE TRADER v4.4
  * ----------------------
- * v4.2 + honest live display & protection:
- *  - live positions track their own entry price (via token decimals),
- *    live multiple, live peak, and their own trail/corpse rules —
- *    shown on cards as "1.42x (pk 2.10x) 🎯"
- *  - live closed cards show real multiple (out/in)
- *  - paper renamed "Signal monitor", £ removed, muted styling
+ * v4.3 + runner-friendly timeout:
+ *  - positions whose trail is ARMED (peaked >= TRAIL_ARM x) are exempt
+ *    from MAX_HOLD_MIN; they exit on bot sell / trail retrace, with a
+ *    long backstop at TRAIL_MAX_HOLD_MIN (default 90m)
+ *  - never-armed positions still time out at MAX_HOLD_MIN (30m)
  */
 
 import http from "http";
@@ -23,6 +22,7 @@ const CONFIG = {
   LIVE_BUY_SLIP: Number(process.env.LIVE_BUY_SLIPPAGE_PCT || 10) / 100,
   LIVE_SELL_SLIP: Number(process.env.LIVE_SELL_SLIPPAGE_PCT || 20) / 100,
   MAX_HOLD_MIN: Number(process.env.MAX_HOLD_MIN || 30),
+  TRAIL_MAX_HOLD_MIN: Number(process.env.TRAIL_MAX_HOLD_MIN || 90),
   CORPSE_MIN: Number(process.env.CORPSE_MIN || 10),
   CORPSE_MULT: Number(process.env.CORPSE_MULT || 0.75),
   TRAIL_ARM: Number(process.env.TRAIL_ARM_MULT || 1.5),
@@ -214,7 +214,7 @@ async function priceFromGecko(mint) {
   return quote > 0 ? quote : null;
 }
 
-const priceCache = new Map(); // mint -> {px, at}
+const priceCache = new Map();
 async function fetchPriceSol(mint) {
   const c = priceCache.get(mint);
   if (c && Date.now() - c.at < 10_000) return c.px;
@@ -510,10 +510,11 @@ setInterval(async () => {
   }
 }, 15_000);
 
-/* slow sweep (60s): corpse cut + timeout + balance + housekeeping */
+/* slow sweep (60s): corpse cut + timeout (trail-aware) + balance */
 setInterval(async () => {
   const tNow = now();
   const holdCutoff = tNow - CONFIG.MAX_HOLD_MIN * 60;
+  const trailHoldCutoff = tNow - CONFIG.TRAIL_MAX_HOLD_MIN * 60;
   const corpseCutoff = tNow - CONFIG.CORPSE_MIN * 60;
 
   for (const [mint, pos] of [...openPositions]) {
@@ -521,12 +522,13 @@ setInterval(async () => {
     if (px && px > pos.peakPrice) pos.peakPrice = px;
     const isCorpse = px !== null && pos.openedAt < corpseCutoff &&
       px < pos.entryPrice * CONFIG.CORPSE_MULT;
+    const cutoff = pos.trailArmed ? trailHoldCutoff : holdCutoff;
     if (isCorpse) {
       await closePosition(mint, "corpse cut");
       if (liveOpen.has(mint)) liveSell(mint, "corpse cut");
-    } else if (pos.openedAt < holdCutoff) {
-      await closePosition(mint, "timeout");
-      if (liveOpen.has(mint)) liveSell(mint, "timeout");
+    } else if (pos.openedAt < cutoff) {
+      await closePosition(mint, pos.trailArmed ? "runner backstop" : "timeout");
+      if (liveOpen.has(mint)) liveSell(mint, pos.trailArmed ? "runner backstop" : "timeout");
     }
   }
   for (const [mint, pos] of [...liveOpen]) {
@@ -534,10 +536,11 @@ setInterval(async () => {
     const px = await fetchPriceSol(mint);
     const m = liveMult(pos, px);
     const isCorpse = m !== null && pos.openedAt < corpseCutoff && m < CONFIG.CORPSE_MULT;
+    const cutoff = pos.liveTrailArmed ? trailHoldCutoff : holdCutoff;
     if (isCorpse && !openPositions.has(mint)) {
       liveSell(mint, "corpse cut");
-    } else if (pos.openedAt < holdCutoff && !openPositions.has(mint)) {
-      liveSell(mint, "timeout");
+    } else if (pos.openedAt < cutoff && !openPositions.has(mint)) {
+      liveSell(mint, pos.liveTrailArmed ? "runner backstop" : "timeout");
     }
   }
 
@@ -652,7 +655,6 @@ const esc = (s) =>
     ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])
   );
 
-let renderTick = 0;
 function renderPage() {
   const s = stats();
   const ls = liveStats();
@@ -773,8 +775,8 @@ function renderPage() {
 </style></head><body>
   <h1>Confluence <em>trader</em></h1>
   <div class="sub">
-    v4.3 · ${CONFIG.WATCH_WALLETS.map((w) => esc(short(w))).join(" + ")} ·
-    exits: their sell · trail (arm ${CONFIG.TRAIL_ARM}x, −${CONFIG.TRAIL_RETRACE * 100}%) · corpse (≤${CONFIG.CORPSE_MULT}x @ ${CONFIG.CORPSE_MIN}m) · ${CONFIG.MAX_HOLD_MIN}m max ·
+    v4.4 · ${CONFIG.WATCH_WALLETS.map((w) => esc(short(w))).join(" + ")} ·
+    exits: their sell · trail (arm ${CONFIG.TRAIL_ARM}x, −${CONFIG.TRAIL_RETRACE * 100}%) · corpse (≤${CONFIG.CORPSE_MULT}x @ ${CONFIG.CORPSE_MIN}m) · ${CONFIG.MAX_HOLD_MIN}m max (runners ${CONFIG.TRAIL_MAX_HOLD_MIN}m) ·
     live slip ${CONFIG.LIVE_BUY_SLIP * 100}/${CONFIG.LIVE_SELL_SLIP * 100}% ·
     night ${CONFIG.NIGHT_START}:00-${CONFIG.NIGHT_END}:00 UK ·
     ${webhookHits} hits · ${CONFIG.TG_TOKEN ? "telegram ✓" : "TELEGRAM NOT SET"}
@@ -835,7 +837,7 @@ const server = http.createServer((req, res) => {
     if (!liveReady()) { res.writeHead(400); return res.end("live engine not configured — check wallet / JUPITER_API_KEY / HELIUS_API_KEY"); }
     rolloverLiveDay();
     liveArmed = true; disarmReason = "";
-    sendTelegram(`🔴 <b>LIVE ARMED</b> — ${CONFIG.LIVE_POSITION_SOL} SOL/trade, max ${CONFIG.LIVE_MAX_OPEN} open, cap −${CONFIG.LIVE_MAX_DAILY_LOSS}, floor ${CONFIG.LIVE_MIN_WALLET}, slip ${CONFIG.LIVE_BUY_SLIP * 100}/${CONFIG.LIVE_SELL_SLIP * 100}%, night ${CONFIG.NIGHT_START}-${CONFIG.NIGHT_END} UK.`);
+    sendTelegram(`🔴 <b>LIVE ARMED</b> — ${CONFIG.LIVE_POSITION_SOL} SOL/trade, max ${CONFIG.LIVE_MAX_OPEN} open, cap −${CONFIG.LIVE_MAX_DAILY_LOSS}, floor ${CONFIG.LIVE_MIN_WALLET}, runners to ${CONFIG.TRAIL_MAX_HOLD_MIN}m.`);
     res.writeHead(200); return res.end("LIVE ARMED. /stop?key=... to disarm.");
   }
   if (path === "/stop") {
@@ -868,7 +870,7 @@ const server = http.createServer((req, res) => {
 });
 
 server.listen(CONFIG.PORT, () => {
-  console.log(`Confluence trader v4.3 on ${CONFIG.PORT} — live ${liveArmed ? "ARMED" : "disarmed"}, ready=${liveReady()}`);
+  console.log(`Confluence trader v4.4 on ${CONFIG.PORT} — live ${liveArmed ? "ARMED" : "disarmed"}, ready=${liveReady()}`);
   if (CONFIG.WATCH_WALLETS.length < 2) console.warn("WARNING: fewer than 2 wallets — confluence can never fire.");
   if (liveWalletError) console.warn(liveWalletError);
 });
