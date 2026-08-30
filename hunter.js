@@ -1,21 +1,32 @@
 /**
- * WALLET HUNTER v3 — self-expanding search for followable traders
+ * WALLET HUNTER v4 — self-expanding search for followable traders
  * ----------------------------------------------------------------
- * v2 + CORRECTED PnL ACCOUNTING.
+ * v3 + VETTING CALIBRATION FIXES.
  *
- * The v2 bug: a token was treated as a closed position if any sells were seen
- * in the window. For patient wallets whose BUYS happened before the window,
- * the sells counted as pure profit — inflating realised SOL several-fold
- * (77eg8Z read +335 SOL vs GMGN's ~55).
+ * v3's checklist rejected almost everything, including the exact species it
+ * was built to find. Three faults, all in vetWallet():
  *
- * v3 only scores MATCHED round trips: first buy inside the window, sells after
- * it. Sells with no in-window buy are excluded and reported as unmatchedSells
- * so you can see how much history was outside view. Wallets with fewer than 3
- * matched positions are not scored at all — a wallet we can only half-see
- * shouldn't be rated as if we'd seen it whole.
+ *   1. "clean wallet" counted INBOUND AIRDROPS — spam the wallet owner cannot
+ *      refuse. 14 of 15 wallets failed it. Replaced with a best-effort
+ *      deployer check (mint / pool-creation txs the wallet paid for).
  *
- * Everything else as v2: alternating TRENDING / EXPANSION discovery, full
- * vetting checklist, re-vetting, dormancy, promotion list.
+ *   2. "not a scalper" failed at >10% sub-5s exits and was CRITICAL, so a
+ *      wallet with a 19-hour median hold was auto-rejected for occasionally
+ *      dumping a rug instantly. Now fails only if fast exits exceed
+ *      MAX_FAST_PCT *and* the median hold is under PATIENT_HOLD_MIN.
+ *
+ *   3. "consistent" hard-failed any wallet with fewer than 4 observed days —
+ *      i.e. penalised a thin sample as if it were bad behaviour. Now SKIPPED
+ *      when there isn't enough history (drops out of the score entirely), but
+ *      such a wallet is capped at WATCH so it can't be promoted on no record.
+ *
+ * Also fixed: the snipe cutoff compared a buy against the oldest transaction
+ * FETCHED, not the coin's first trade, so on high-volume coins it silently
+ * excluded genuine early buyers. It now only applies when the harvester
+ * actually paged back to the start of the coin's history.
+ *
+ * Dashboard now shows a rejection tally and near-misses so miscalibration is
+ * visible without reading db.json.
  * This service NEVER trades. It only reads the chain.
  */
 
@@ -46,6 +57,13 @@ const CFG = {
   DORMANT_DAYS: Number(process.env.DORMANT_DAYS || 10),
   MAX_REVET_PER_CYCLE: Number(process.env.MAX_REVET_PER_CYCLE || 2),
   DATA_DIR: process.env.DATA_DIR || "/data",
+
+  /* v4 vetting calibration */
+  MAX_FAST_PCT: Number(process.env.MAX_FAST_PCT || 40),        // was hardcoded 10
+  PATIENT_HOLD_MIN: Number(process.env.PATIENT_HOLD_MIN || 60), // median hold that excuses fast exits
+  MIN_DAYS: Number(process.env.MIN_DAYS || 4),                  // below this, consistency is unmeasurable
+  MIN_GREEN_RATIO: Number(process.env.MIN_GREEN_RATIO || 0.4),
+  MAX_MINT_EVENTS: Number(process.env.MAX_MINT_EVENTS || 3),    // deployer tolerance
 };
 
 const SOL_MINT = "So11111111111111111111111111111111111111112";
@@ -61,6 +79,7 @@ const PROGRAMS = new Set([
   "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",
   "jitodontfront111111111111111111111nopainnogain",
 ]);
+const MINT_TYPES = new Set(["TOKEN_MINT", "CREATE_POOL", "INITIALIZE_MINT"]);
 const LAMPORTS = 1e9;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const now = () => Math.floor(Date.now() / 1000);
@@ -228,12 +247,13 @@ async function harvestCoin(coin) {
   const traders = {};
   let before = "";
   let firstSeen = null;
+  let reachedStart = false;          // v4: did we actually page back to the coin's first trade?
   for (let page = 0; page < CFG.COIN_PAGES; page++) {
     status = `harvest ${coin.name} page ${page + 1}`;
     let batch;
     try { batch = await heliusPage(coin.mint, before); } catch { break; }
     if (batch === null) { page--; continue; }
-    if (!batch.length) break;
+    if (!batch.length) { reachedStart = true; break; }
     for (const tx of batch) {
       if (firstSeen === null || tx.timestamp < firstSeen) firstSeen = tx.timestamp;
       for (const tr of tx.tokenTransfers || []) {
@@ -258,12 +278,13 @@ async function harvestCoin(coin) {
     if (!b.buys.length || !b.sells.length) continue;
     const firstBuy = Math.min(...b.buys.map((x) => x.ts));
     const sellsAfter = b.sells.filter((s) => s.ts >= firstBuy);
-    if (!sellsAfter.length) continue;                       // v3: matched only
+    if (!sellsAfter.length) continue;                       // matched round trips only
     const lastSell = Math.max(...sellsAfter.map((x) => x.ts));
     const buySol = b.buys.reduce((s, x) => s + x.sol, 0);
     const sellSol = sellsAfter.reduce((s, x) => s + x.sol, 0);
     const holdMin = (lastSell - firstBuy) / 60;
-    if (firstSeen !== null && firstBuy - firstSeen <= CFG.SNIPE_CUTOFF_S) continue;
+    // v4: only a genuine snipe if we can see the coin's actual beginning
+    if (reachedStart && firstSeen !== null && firstBuy - firstSeen <= CFG.SNIPE_CUTOFF_S) continue;
     if (holdMin < CFG.MIN_HOLD_MIN) continue;
     if (sellSol <= buySol * 1.05) continue;
     winners.push({ wallet: w, profitSol: +(sellSol - buySol).toFixed(3), holdMin: Math.round(holdMin) });
@@ -273,7 +294,7 @@ async function harvestCoin(coin) {
   return winners.slice(0, 8);
 }
 
-/* ── VET (v3 accounting) ────────────────────────────────── */
+/* ── VET ────────────────────────────────────────────────── */
 
 async function fetchWalletTxs(wallet) {
   const cutoff = now() - CFG.VET_DAYS * DAY;
@@ -318,7 +339,9 @@ async function vetWallet(wallet) {
 
   const perMint = {};
   let airdropped = 0;
+  let mintEvents = 0;   // v4: deployer signal
   for (const tx of txs) {
+    if (tx.feePayer === wallet && MINT_TYPES.has(String(tx.type || ""))) mintEvents++;
     const { paid, recv } = solLeg(tx, wallet);
     for (const tr of tx.tokenTransfers || []) {
       if (!tr.mint || QUOTES.has(tr.mint)) continue;
@@ -333,7 +356,7 @@ async function vetWallet(wallet) {
     }
   }
 
-  /* v3: only MATCHED round trips — first buy in window, sells after it.
+  /* only MATCHED round trips — first buy in window, sells after it.
      Sells with no in-window buy are excluded and counted separately. */
   const positions = [];
   let unmatchedSells = 0;
@@ -362,7 +385,7 @@ async function vetWallet(wallet) {
   if (!positions.length) return null;
 
   const closed = positions.filter((p) => p.closed);
-  if (closed.length < CFG.MIN_MATCHED) return null;   // v3: need real round trips
+  if (closed.length < CFG.MIN_MATCHED) return null;   // need real round trips
 
   const wins = closed.filter((p) => p.pnl > 0);
   const totalPnl = closed.reduce((s, p) => s + p.pnl, 0);
@@ -380,6 +403,7 @@ async function vetWallet(wallet) {
   }
   const days = Object.values(byDay);
   const greenDays = days.filter((v) => v > 0).length;
+  const thinHistory = days.length < CFG.MIN_DAYS;
 
   const recentMints = positions.slice().sort((a, b) => b.firstBuy - a.firstBuy).map((p) => p.mint);
   status = `vet ${wallet.slice(0, 6)}… liquidity`;
@@ -387,23 +411,45 @@ async function vetWallet(wallet) {
   const medLiq = liq.length ? liq[Math.floor(liq.length / 2)] : 0;
 
   const checks = [];
-  const add = (name, pass, detail) => checks.push({ name, pass, detail });
+  const add = (name, pass, detail, skip = false) => checks.push({ name, pass, detail, skip });
+
   add("hold duration", medHold >= CFG.MIN_HOLD_MIN, `median ${medHold.toFixed(0)}m`);
-  add("not a scalper", fastPct <= 10, `${fastPct.toFixed(0)}% exits <5s`);
+
+  // v4: fast exits only condemn a wallet that ALSO flips quickly on the median
+  const scalping = fastPct > CFG.MAX_FAST_PCT && medHold < CFG.PATIENT_HOLD_MIN;
+  add("not a scalper", !scalping,
+    `${fastPct.toFixed(0)}% exits <5s${fastPct > CFG.MAX_FAST_PCT && !scalping ? ` (excused, ${medHold.toFixed(0)}m median)` : ""}`);
+
   add("human pace", positions.length <= CFG.MAX_TOKENS, `${positions.length} tokens/${CFG.VET_DAYS}d`);
   add("win rate band", winRate >= CFG.MIN_WR && winRate <= CFG.MAX_WR, `${winRate.toFixed(0)}%`);
   add("profitable", totalPnl > 0, `${totalPnl >= 0 ? "+" : ""}${totalPnl.toFixed(2)} SOL matched`);
   add("tradeable liquidity", medLiq >= CFG.MIN_LIQ_USD, `median pool $${Math.round(medLiq).toLocaleString()}`);
-  add("consistent", days.length >= 4 && greenDays / days.length >= 0.4, `${greenDays}/${days.length} green days`);
-  add("clean wallet", airdropped / Math.max(positions.length, 1) < 0.5, `${airdropped} airdrops`);
 
-  const passed = checks.filter((c) => c.pass).length;
+  // v4: unmeasurable on a thin sample — skipped, not failed
+  add("consistent",
+    greenDays / Math.max(days.length, 1) >= CFG.MIN_GREEN_RATIO,
+    thinHistory ? `only ${days.length}d observed — not scored` : `${greenDays}/${days.length} green days`,
+    thinHistory);
+
+  // v4: replaces the old airdrop-ratio check, which punished inbound spam
+  add("not a deployer", mintEvents < CFG.MAX_MINT_EVENTS,
+    mintEvents ? `${mintEvents} mint/pool txs` : "no mints or pools created");
+
+  const scored = checks.filter((c) => !c.skip);
+  const passed = scored.filter((c) => c.pass).length;
+  const failedChecks = scored.filter((c) => !c.pass).map((c) => c.name);
   const critical = ["hold duration", "not a scalper", "profitable"];
-  const criticalFail = checks.some((c) => critical.includes(c.name) && !c.pass);
-  const verdict = criticalFail ? "REJECT" : passed >= 7 ? "FOLLOW" : passed >= 5 ? "WATCH" : "REJECT";
+  const criticalFail = scored.some((c) => critical.includes(c.name) && !c.pass);
+
+  let verdict = criticalFail ? "REJECT"
+    : passed >= scored.length - 1 ? "FOLLOW"
+    : passed >= scored.length - 3 ? "WATCH" : "REJECT";
+  // a wallet we've barely observed cannot be promoted, however well it scores
+  if (verdict === "FOLLOW" && thinHistory) verdict = "WATCH";
 
   return {
-    wallet, verdict, passed, checksTotal: checks.length, vettedAt: now(), lastActiveTs,
+    wallet, verdict, passed, checksTotal: scored.length, failedChecks,
+    vettedAt: now(), lastActiveTs,
     dormant: now() - lastActiveTs > CFG.DORMANT_DAYS * DAY,
     stats: {
       tokens: positions.length, closed: closed.length, openPositions, unmatchedSells,
@@ -411,6 +457,7 @@ async function vetWallet(wallet) {
       medianHoldMin: +medHold.toFixed(1), fastFlipPct: +fastPct.toFixed(1),
       medianPositionSol: +medSize.toFixed(3),
       medianPoolUsd: Math.round(medLiq), greenDays, totalDays: days.length,
+      airdrops: airdropped, mintEvents,
     },
     checks,
   };
@@ -480,7 +527,8 @@ async function cycle() {
         const card = await vetWallet(w);
         if (!card) { logLine(`  ${w.slice(0, 6)}… skipped (too few matched round trips)`); continue; }
         storeCard(card, `${meta.via} · ${meta.hits} coin(s)`);
-        logLine(`  ${w.slice(0, 6)}… ${card.verdict} (${card.passed}/8) ${card.stats.realisedSol >= 0 ? "+" : ""}${card.stats.realisedSol} SOL`);
+        const why = card.failedChecks.length ? ` — failed: ${card.failedChecks.join(", ")}` : "";
+        logLine(`  ${w.slice(0, 6)}… ${card.verdict} (${card.passed}/${card.checksTotal}) ${card.stats.realisedSol >= 0 ? "+" : ""}${card.stats.realisedSol} SOL${why}`);
       } catch (e) { logLine(`  ${w.slice(0, 6)}… vet failed: ${e.message}`); }
     }
 
@@ -530,7 +578,24 @@ function renderPage() {
   const follows = all.filter((w) => w.verdict === "FOLLOW" && !w.dormant);
   const watches = all.filter((w) => w.verdict === "WATCH" && !w.dormant);
   const dormant = all.filter((w) => w.dormant && w.verdict !== "REJECT");
+  const nearMiss = all.filter((w) => w.verdict === "REJECT" && !w.dormant
+    && w.passed >= (w.checksTotal || 8) - 2).slice(0, 8);
   const promoteList = follows.map((w) => w.wallet).join(",");
+
+  // v4: which checks are doing the rejecting, across everything vetted
+  const tally = {};
+  for (const w of all) {
+    for (const c of w.checks || []) {
+      if (c.skip) continue;
+      const t = (tally[c.name] ||= { fail: 0, seen: 0 });
+      t.seen++;
+      if (!c.pass) t.fail++;
+    }
+  }
+  const tallyRows = Object.entries(tally)
+    .sort((a, b) => (b[1].fail / b[1].seen) - (a[1].fail / a[1].seen))
+    .map(([n, t]) => `<div class="tline"><span>${esc(n)}</span><span>${t.fail}/${t.seen}</span></div>`).join("");
+
   const ago = (ts) => {
     if (!ts) return "never";
     const d = now() - ts;
@@ -543,9 +608,10 @@ function renderPage() {
 
   const row = (w) => `<li class="row ${w.verdict.toLowerCase()}"><div class="body">
     <div class="head"><span class="sym">${esc(w.wallet.slice(0, 6))}…${esc(w.wallet.slice(-4))}</span>
-      <span class="x">${w.verdict} ${w.passed}/8${trendMark(w.trend)}</span></div>
+      <span class="x">${w.verdict} ${w.passed}/${w.checksTotal || 8}${trendMark(w.trend)}</span></div>
     <div class="meta">${w.stats.realisedSol >= 0 ? "+" : ""}${w.stats.realisedSol} SOL matched · ${w.stats.winRatePct}% win · hold ${w.stats.medianHoldMin}m · ${w.stats.closed} round trips · pool $${w.stats.medianPoolUsd.toLocaleString()}</div>
     <div class="meta">${w.stats.tokens} tokens · ${w.stats.openPositions || 0} still open · ${w.stats.unmatchedSells || 0} sells outside window · median size ${w.stats.medianPositionSol || "?"} SOL</div>
+    ${(w.failedChecks && w.failedChecks.length) ? `<div class="meta fail">failed: ${esc(w.failedChecks.join(", "))}</div>` : ""}
     <div class="meta">via ${esc(w.provenance || "?")} · vetted ${ago(w.vettedAt)} · last traded ${ago(w.lastActiveTs)}</div>
     <div class="meta mono">${esc(w.wallet)}</div>
   </div></li>`;
@@ -575,7 +641,7 @@ function renderPage() {
   .row{background:var(--panel);border:1px solid var(--edge);border-left:2px solid var(--slate);padding:11px 12px;margin-bottom:8px}
   .row.follow{border-left-color:var(--green)}
   .row.watch{border-left-color:var(--amber)}
-  .row.reject{border-left-color:var(--clay);opacity:.4}
+  .row.reject{border-left-color:var(--clay);opacity:.65}
   .head{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:3px}
   .sym{font-weight:600}
   .x{font-family:'Space Grotesk',sans-serif;font-weight:700;font-size:13px}
@@ -583,6 +649,7 @@ function renderPage() {
   .row.watch .x{color:var(--amber)}
   .row.reject .x{color:var(--clay)}
   .meta{color:var(--slate);font-size:10.5px;margin-top:2px}
+  .meta.fail{color:var(--clay)}
   .mono{word-break:break-all;font-size:9.5px;user-select:all}
   .none{color:var(--slate);font-size:12px;padding:12px;background:var(--panel);border:1px dashed var(--edge)}
   .logline{color:var(--slate);font-size:10px;padding:2px 0;border-bottom:1px solid var(--edge)}
@@ -591,15 +658,19 @@ function renderPage() {
   .promote b{color:var(--green);font-size:11px;text-transform:uppercase;letter-spacing:.08em}
   .promote .val{word-break:break-all;font-size:10px;margin-top:6px;user-select:all;color:var(--ink)}
   .note{color:var(--slate);font-size:10px;margin-top:6px}
+  .tally{background:var(--panel);border:1px solid var(--edge);padding:10px 12px;margin-bottom:14px}
+  .tally b{font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:var(--ink)}
+  .tline{display:flex;justify-content:space-between;color:var(--slate);font-size:10.5px;margin-top:3px}
 </style></head><body>
   <h1>Wallet <em>hunter</em></h1>
   <div class="sub">
-    v3 · matched-round-trip accounting · alternating TRENDING / EXPANSION · cycle ${CFG.CYCLE_MINUTES}m · vet ${CFG.MAX_VET_PER_CYCLE}/cycle ·
-    filters: hold ≥${CFG.MIN_HOLD_MIN}m · win ${CFG.MIN_WR}-${CFG.MAX_WR}% · pool ≥$${CFG.MIN_LIQ_USD.toLocaleString()} · ≥${CFG.MIN_MATCHED} round trips ·
+    v4 · calibrated vetting · alternating TRENDING / EXPANSION · cycle ${CFG.CYCLE_MINUTES}m · vet ${CFG.MAX_VET_PER_CYCLE}/cycle ·
+    filters: hold ≥${CFG.MIN_HOLD_MIN}m · fast exits ≤${CFG.MAX_FAST_PCT}% (unless median ≥${CFG.PATIENT_HOLD_MIN}m) ·
+    win ${CFG.MIN_WR}-${CFG.MAX_WR}% · pool ≥$${CFG.MIN_LIQ_USD.toLocaleString()} · ≥${CFG.MIN_MATCHED} round trips ·
     ${persistOk ? "database saved ✓" : "IN MEMORY ONLY"} · <a href="/db.json" style="color:var(--green)">db.json</a>
   </div>
   <div class="status">▶ ${esc(status)}<br>cycles: ${DB.cycles} (last ${DB.lastMode || "—"}, ${ago(DB.lastCycleAt)}) · coins scanned: ${Object.keys(DB.seenCoins).length} · wallets known: ${all.length}
-  <div class="note">SOL figures count only round trips that opened inside the ${CFG.VET_DAYS}-day window. Wallets holding longer than that will read lower than GMGN — check there before promoting.</div></div>
+  <div class="note">SOL figures count only round trips that opened inside the ${CFG.VET_DAYS}-day window. Wallets holding longer than that will read lower than GMGN — check there before promoting. Wallets with fewer than ${CFG.MIN_DAYS} observed days cannot be promoted above WATCH.</div></div>
   ${promoteList ? `<div class="promote"><b>Copy into FOLLOW_WALLETS (paper first)</b><div class="val">${esc(promoteList)}</div></div>` : ""}
   <div class="cards">
     <div class="card"><b style="color:var(--green)">${follows.length}</b><span>follow</span></div>
@@ -607,10 +678,12 @@ function renderPage() {
     <div class="card"><b>${all.length}</b><span>vetted</span></div>
     <div class="card"><b>${dormant.length}</b><span>dormant</span></div>
   </div>
+  ${tallyRows ? `<div class="tally"><b>What's rejecting them</b>${tallyRows}</div>` : ""}
   <h2>✅ Worth following</h2>
   ${follows.length ? `<ul>${follows.map(row).join("")}</ul>` : `<div class="none">None yet — the filters are strict by design.</div>`}
   <h2>👀 Watch list</h2>
   ${watches.length ? `<ul>${watches.map(row).join("")}</ul>` : `<div class="none">None yet.</div>`}
+  ${nearMiss.length ? `<h2>⚠️ Near misses (within 2 checks)</h2><ul>${nearMiss.map(row).join("")}</ul>` : ""}
   ${dormant.length ? `<h2>💤 Dormant (no trades in ${CFG.DORMANT_DAYS}d)</h2><ul>${dormant.map(row).join("")}</ul>` : ""}
   <h2>Recent activity</h2>
   <ul>${logRows}</ul>
@@ -637,7 +710,7 @@ http.createServer((req, res) => {
   res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
   res.end(renderPage());
 }).listen(CFG.PORT, () => {
-  console.log(`Wallet hunter v3 on ${CFG.PORT} — persistence ${persistOk ? "ON" : "OFF"}`);
+  console.log(`Wallet hunter v4 on ${CFG.PORT} — persistence ${persistOk ? "ON" : "OFF"}`);
   if (!CFG.KEY) { status = "FAILED: HELIUS_API_KEY not set"; return; }
   cycle();
   setInterval(cycle, CFG.CYCLE_MINUTES * 60 * 1000);
