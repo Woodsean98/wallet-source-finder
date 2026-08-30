@@ -1,26 +1,22 @@
 /**
- * WALLET HUNTER v2 — self-expanding search for followable traders
+ * WALLET HUNTER v3 — self-expanding search for followable traders
  * ----------------------------------------------------------------
- * Runs forever, alternating two discovery modes:
- *   ODD cycles  — TRENDING: pull trending Solana coins (GeckoTerminal, free),
- *                 filter to multi-day coins with real liquidity, harvest the
- *                 patient winners on each.
- *   EVEN cycles — EXPANSION: take wallets already rated FOLLOW/WATCH, pull the
- *                 coins THEY traded, harvest the patient winners there. Wallets
- *                 that keep appearing beside proven ones are the same species.
- *                 (Falls back to TRENDING if no good wallets known yet.)
- * Then: vet every new candidate on the full followability checklist, store the
- * scorecard, re-vet ageing wallets, demote faders, flag dormant ones, and
- * maintain a copy-ready promotion list of the best.
+ * v2 + CORRECTED PnL ACCOUNTING.
  *
- * Dashboard "/" · raw db "/db.json" · promote list "/promote.txt"
+ * The v2 bug: a token was treated as a closed position if any sells were seen
+ * in the window. For patient wallets whose BUYS happened before the window,
+ * the sells counted as pure profit — inflating realised SOL several-fold
+ * (77eg8Z read +335 SOL vs GMGN's ~55).
+ *
+ * v3 only scores MATCHED round trips: first buy inside the window, sells after
+ * it. Sells with no in-window buy are excluded and reported as unmatchedSells
+ * so you can see how much history was outside view. Wallets with fewer than 3
+ * matched positions are not scored at all — a wallet we can only half-see
+ * shouldn't be rated as if we'd seen it whole.
+ *
+ * Everything else as v2: alternating TRENDING / EXPANSION discovery, full
+ * vetting checklist, re-vetting, dormancy, promotion list.
  * This service NEVER trades. It only reads the chain.
- *
- * Env: HELIUS_API_KEY (required)
- *   CYCLE_MINUTES 45 · COINS_PER_CYCLE 6 · MAX_VET_PER_CYCLE 5
- *   MIN_LIQ_USD 30000 · MIN_COIN_AGE_H 24 · VET_DAYS 30
- *   MIN_HOLD_MIN 10 · MAX_TOKENS 400 · MIN_WR 25 · MAX_WR 75
- *   REVET_DAYS 5 · DORMANT_DAYS 10 · EXPANSION_COINS 6 · DATA_DIR /data
  */
 
 import http from "http";
@@ -41,6 +37,7 @@ const CFG = {
   MAX_TOKENS: Number(process.env.MAX_TOKENS || 400),
   MIN_WR: Number(process.env.MIN_WR || 25),
   MAX_WR: Number(process.env.MAX_WR || 75),
+  MIN_MATCHED: Number(process.env.MIN_MATCHED || 3),
   MIN_BUY_SOL: Number(process.env.MIN_BUY_SOL || 0.05),
   SNIPE_CUTOFF_S: Number(process.env.SNIPE_CUTOFF_S || 120),
   COIN_PAGES: Number(process.env.COIN_PAGES || 10),
@@ -80,13 +77,8 @@ try {
 } catch { persistOk = false; }
 
 const DB = {
-  wallets: {},      // address -> scorecard { verdict, stats, history[], provenance, lastActiveTs }
-  seenCoins: {},    // mint -> ts scanned
-  cycles: 0,
-  startedAt: now(),
-  lastCycleAt: null,
-  lastMode: null,
-  log: [],
+  wallets: {}, seenCoins: {}, cycles: 0,
+  startedAt: now(), lastCycleAt: null, lastMode: null, log: [],
 };
 
 function loadDb() {
@@ -265,9 +257,11 @@ async function harvestCoin(coin) {
   for (const [w, b] of Object.entries(traders)) {
     if (!b.buys.length || !b.sells.length) continue;
     const firstBuy = Math.min(...b.buys.map((x) => x.ts));
-    const lastSell = Math.max(...b.sells.map((x) => x.ts));
+    const sellsAfter = b.sells.filter((s) => s.ts >= firstBuy);
+    if (!sellsAfter.length) continue;                       // v3: matched only
+    const lastSell = Math.max(...sellsAfter.map((x) => x.ts));
     const buySol = b.buys.reduce((s, x) => s + x.sol, 0);
-    const sellSol = b.sells.reduce((s, x) => s + x.sol, 0);
+    const sellSol = sellsAfter.reduce((s, x) => s + x.sol, 0);
     const holdMin = (lastSell - firstBuy) / 60;
     if (firstSeen !== null && firstBuy - firstSeen <= CFG.SNIPE_CUTOFF_S) continue;
     if (holdMin < CFG.MIN_HOLD_MIN) continue;
@@ -279,7 +273,7 @@ async function harvestCoin(coin) {
   return winners.slice(0, 8);
 }
 
-/* ── VET ────────────────────────────────────────────────── */
+/* ── VET (v3 accounting) ────────────────────────────────── */
 
 async function fetchWalletTxs(wallet) {
   const cutoff = now() - CFG.VET_DAYS * DAY;
@@ -339,29 +333,45 @@ async function vetWallet(wallet) {
     }
   }
 
+  /* v3: only MATCHED round trips — first buy in window, sells after it.
+     Sells with no in-window buy are excluded and counted separately. */
   const positions = [];
+  let unmatchedSells = 0;
+  let openPositions = 0;
   for (const [mint, m] of Object.entries(perMint)) {
-    if (!m.buys.length) continue;
-    const buySol = m.buys.reduce((s, b) => s + b.sol, 0);
-    const sellSol = m.sells.reduce((s, x) => s + x.sol, 0);
+    if (!m.buys.length) {
+      if (m.sells.length) unmatchedSells += m.sells.length;
+      continue;
+    }
     const firstBuy = Math.min(...m.buys.map((b) => b.ts));
-    const lastSell = m.sells.length ? Math.max(...m.sells.map((s) => s.ts)) : null;
+    const sellsAfter = m.sells.filter((s) => s.ts >= firstBuy);
+    const sellsBefore = m.sells.length - sellsAfter.length;
+    if (sellsBefore) unmatchedSells += sellsBefore;
+    const buySol = m.buys.reduce((s, b) => s + b.sol, 0);
+    const sellSol = sellsAfter.reduce((s, x) => s + x.sol, 0);
+    const closed = sellsAfter.length > 0;
+    if (!closed) openPositions++;
+    const lastSell = closed ? Math.max(...sellsAfter.map((s) => s.ts)) : null;
     positions.push({
-      mint, buySol, sellSol, closed: !!m.sells.length,
-      pnl: m.sells.length ? sellSol - buySol : 0,
-      holdMin: lastSell ? (lastSell - firstBuy) / 60 : null, firstBuy,
+      mint, buySol, sellSol, closed,
+      pnl: closed ? sellSol - buySol : 0,
+      holdMin: closed ? (lastSell - firstBuy) / 60 : null,
+      firstBuy,
     });
   }
   if (!positions.length) return null;
 
   const closed = positions.filter((p) => p.closed);
-  if (closed.length < 3) return null;
+  if (closed.length < CFG.MIN_MATCHED) return null;   // v3: need real round trips
+
   const wins = closed.filter((p) => p.pnl > 0);
   const totalPnl = closed.reduce((s, p) => s + p.pnl, 0);
-  const holds = closed.map((p) => p.holdMin).filter((h) => h !== null).sort((a, b) => a - b);
-  const medHold = holds.length ? holds[Math.floor(holds.length / 2)] : 0;
-  const fastPct = (closed.filter((p) => p.holdMin !== null && p.holdMin < 1 / 12).length / closed.length) * 100;
+  const holds = closed.map((p) => p.holdMin).sort((a, b) => a - b);
+  const medHold = holds[Math.floor(holds.length / 2)];
+  const fastPct = (closed.filter((p) => p.holdMin < 1 / 12).length / closed.length) * 100;
   const winRate = (wins.length / closed.length) * 100;
+  const sizes = positions.map((p) => p.buySol).sort((a, b) => a - b);
+  const medSize = sizes[Math.floor(sizes.length / 2)];
 
   const byDay = {};
   for (const p of closed) {
@@ -382,7 +392,7 @@ async function vetWallet(wallet) {
   add("not a scalper", fastPct <= 10, `${fastPct.toFixed(0)}% exits <5s`);
   add("human pace", positions.length <= CFG.MAX_TOKENS, `${positions.length} tokens/${CFG.VET_DAYS}d`);
   add("win rate band", winRate >= CFG.MIN_WR && winRate <= CFG.MAX_WR, `${winRate.toFixed(0)}%`);
-  add("profitable", totalPnl > 0, `${totalPnl >= 0 ? "+" : ""}${totalPnl.toFixed(2)} SOL`);
+  add("profitable", totalPnl > 0, `${totalPnl >= 0 ? "+" : ""}${totalPnl.toFixed(2)} SOL matched`);
   add("tradeable liquidity", medLiq >= CFG.MIN_LIQ_USD, `median pool $${Math.round(medLiq).toLocaleString()}`);
   add("consistent", days.length >= 4 && greenDays / days.length >= 0.4, `${greenDays}/${days.length} green days`);
   add("clean wallet", airdropped / Math.max(positions.length, 1) < 0.5, `${airdropped} airdrops`);
@@ -396,9 +406,10 @@ async function vetWallet(wallet) {
     wallet, verdict, passed, checksTotal: checks.length, vettedAt: now(), lastActiveTs,
     dormant: now() - lastActiveTs > CFG.DORMANT_DAYS * DAY,
     stats: {
-      tokens: positions.length, closed: closed.length,
+      tokens: positions.length, closed: closed.length, openPositions, unmatchedSells,
       winRatePct: +winRate.toFixed(1), realisedSol: +totalPnl.toFixed(3),
       medianHoldMin: +medHold.toFixed(1), fastFlipPct: +fastPct.toFixed(1),
+      medianPositionSol: +medSize.toFixed(3),
       medianPoolUsd: Math.round(medLiq), greenDays, totalDays: days.length,
     },
     checks,
@@ -467,13 +478,12 @@ async function cycle() {
     for (const [w, meta] of queue) {
       try {
         const card = await vetWallet(w);
-        if (!card) continue;
+        if (!card) { logLine(`  ${w.slice(0, 6)}… skipped (too few matched round trips)`); continue; }
         storeCard(card, `${meta.via} · ${meta.hits} coin(s)`);
-        logLine(`  ${w.slice(0, 6)}… ${card.verdict} (${card.passed}/8)`);
+        logLine(`  ${w.slice(0, 6)}… ${card.verdict} (${card.passed}/8) ${card.stats.realisedSol >= 0 ? "+" : ""}${card.stats.realisedSol} SOL`);
       } catch (e) { logLine(`  ${w.slice(0, 6)}… vet failed: ${e.message}`); }
     }
 
-    // re-vet ageing good wallets so faders get demoted
     const stale = Object.values(DB.wallets)
       .filter((w) => (w.verdict === "FOLLOW" || w.verdict === "WATCH")
         && now() - w.vettedAt > CFG.REVET_DAYS * DAY)
@@ -490,7 +500,6 @@ async function cycle() {
       } catch {}
     }
 
-    // dormancy sweep
     for (const w of Object.values(DB.wallets)) {
       w.dormant = w.lastActiveTs ? now() - w.lastActiveTs > CFG.DORMANT_DAYS * DAY : false;
     }
@@ -535,7 +544,8 @@ function renderPage() {
   const row = (w) => `<li class="row ${w.verdict.toLowerCase()}"><div class="body">
     <div class="head"><span class="sym">${esc(w.wallet.slice(0, 6))}…${esc(w.wallet.slice(-4))}</span>
       <span class="x">${w.verdict} ${w.passed}/8${trendMark(w.trend)}</span></div>
-    <div class="meta">${w.stats.realisedSol >= 0 ? "+" : ""}${w.stats.realisedSol} SOL · ${w.stats.winRatePct}% win · hold ${w.stats.medianHoldMin}m · ${w.stats.tokens} tokens · pool $${w.stats.medianPoolUsd.toLocaleString()}</div>
+    <div class="meta">${w.stats.realisedSol >= 0 ? "+" : ""}${w.stats.realisedSol} SOL matched · ${w.stats.winRatePct}% win · hold ${w.stats.medianHoldMin}m · ${w.stats.closed} round trips · pool $${w.stats.medianPoolUsd.toLocaleString()}</div>
+    <div class="meta">${w.stats.tokens} tokens · ${w.stats.openPositions || 0} still open · ${w.stats.unmatchedSells || 0} sells outside window · median size ${w.stats.medianPositionSol || "?"} SOL</div>
     <div class="meta">via ${esc(w.provenance || "?")} · vetted ${ago(w.vettedAt)} · last traded ${ago(w.lastActiveTs)}</div>
     <div class="meta mono">${esc(w.wallet)}</div>
   </div></li>`;
@@ -580,14 +590,16 @@ function renderPage() {
   .promote{background:#12211A;border:1px solid var(--green);padding:10px 12px;margin-bottom:14px}
   .promote b{color:var(--green);font-size:11px;text-transform:uppercase;letter-spacing:.08em}
   .promote .val{word-break:break-all;font-size:10px;margin-top:6px;user-select:all;color:var(--ink)}
+  .note{color:var(--slate);font-size:10px;margin-top:6px}
 </style></head><body>
   <h1>Wallet <em>hunter</em></h1>
   <div class="sub">
-    v2 · alternating TRENDING / EXPANSION · cycle ${CFG.CYCLE_MINUTES}m · vet ${CFG.MAX_VET_PER_CYCLE}/cycle · re-vet after ${CFG.REVET_DAYS}d ·
-    filters: hold ≥${CFG.MIN_HOLD_MIN}m · win ${CFG.MIN_WR}-${CFG.MAX_WR}% · pool ≥$${CFG.MIN_LIQ_USD.toLocaleString()} ·
+    v3 · matched-round-trip accounting · alternating TRENDING / EXPANSION · cycle ${CFG.CYCLE_MINUTES}m · vet ${CFG.MAX_VET_PER_CYCLE}/cycle ·
+    filters: hold ≥${CFG.MIN_HOLD_MIN}m · win ${CFG.MIN_WR}-${CFG.MAX_WR}% · pool ≥$${CFG.MIN_LIQ_USD.toLocaleString()} · ≥${CFG.MIN_MATCHED} round trips ·
     ${persistOk ? "database saved ✓" : "IN MEMORY ONLY"} · <a href="/db.json" style="color:var(--green)">db.json</a>
   </div>
-  <div class="status">▶ ${esc(status)}<br>cycles: ${DB.cycles} (last ${DB.lastMode || "—"}, ${ago(DB.lastCycleAt)}) · coins scanned: ${Object.keys(DB.seenCoins).length} · wallets known: ${all.length}</div>
+  <div class="status">▶ ${esc(status)}<br>cycles: ${DB.cycles} (last ${DB.lastMode || "—"}, ${ago(DB.lastCycleAt)}) · coins scanned: ${Object.keys(DB.seenCoins).length} · wallets known: ${all.length}
+  <div class="note">SOL figures count only round trips that opened inside the ${CFG.VET_DAYS}-day window. Wallets holding longer than that will read lower than GMGN — check there before promoting.</div></div>
   ${promoteList ? `<div class="promote"><b>Copy into FOLLOW_WALLETS (paper first)</b><div class="val">${esc(promoteList)}</div></div>` : ""}
   <div class="cards">
     <div class="card"><b style="color:var(--green)">${follows.length}</b><span>follow</span></div>
@@ -625,7 +637,7 @@ http.createServer((req, res) => {
   res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
   res.end(renderPage());
 }).listen(CFG.PORT, () => {
-  console.log(`Wallet hunter v2 on ${CFG.PORT} — persistence ${persistOk ? "ON" : "OFF"}`);
+  console.log(`Wallet hunter v3 on ${CFG.PORT} — persistence ${persistOk ? "ON" : "OFF"}`);
   if (!CFG.KEY) { status = "FAILED: HELIUS_API_KEY not set"; return; }
   cycle();
   setInterval(cycle, CFG.CYCLE_MINUTES * 60 * 1000);
