@@ -1,32 +1,29 @@
 /**
- * WALLET HUNTER v4 — self-expanding search for followable traders
+ * WALLET HUNTER v5 — self-expanding search for followable traders
  * ----------------------------------------------------------------
- * v3 + VETTING CALIBRATION FIXES.
+ * v4 + QUANTITY-MATCHED FIFO ACCOUNTING.
  *
- * v3's checklist rejected almost everything, including the exact species it
- * was built to find. Three faults, all in vetWallet():
+ * The v3/v4 bug: PnL per mint was (sum of sells) − (sum of buys), with no
+ * regard for how many TOKENS moved. A wallet that scales out over several
+ * sells therefore had its proceeds booked against a cost basis it had never
+ * fully unwound — and any sell of a bag bought before the window inflated the
+ * total outright. 9Qyptj read +137 SOL (~$14K) here against GMGN's $1.62K.
  *
- *   1. "clean wallet" counted INBOUND AIRDROPS — spam the wallet owner cannot
- *      refuse. 14 of 15 wallets failed it. Replaced with a best-effort
- *      deployer check (mint / pool-creation txs the wallet paid for).
+ * v5 tracks quantity per lot. Sells are matched against buys FIFO; realised
+ * profit counts only the matched quantity, at that quantity's true cost basis.
+ * Unsold remainder is reported as open, never banked. Sells that cannot be
+ * matched to an in-window buy are excluded and counted separately.
  *
- *   2. "not a scalper" failed at >10% sub-5s exits and was CRITICAL, so a
- *      wallet with a 19-hour median hold was auto-rejected for occasionally
- *      dumping a rug instantly. Now fails only if fast exits exceed
- *      MAX_FAST_PCT *and* the median hold is under PATIENT_HOLD_MIN.
+ * Two new checks, both learned from wallets that passed v4 and shouldn't have:
+ *   · "worthwhile edge"  — realised profit as % of matched cost. A wallet
+ *     making 0.6% per month on huge size has a real edge that vanishes
+ *     entirely at a 0.3 SOL stake. CRITICAL.
+ *   · "not a machine"    — raw 30d transaction count. Token count alone misses
+ *     a grinder that re-enters the same coins hundreds of times.
  *
- *   3. "consistent" hard-failed any wallet with fewer than 4 observed days —
- *      i.e. penalised a thin sample as if it were bad behaviour. Now SKIPPED
- *      when there isn't enough history (drops out of the score entirely), but
- *      such a wallet is capped at WATCH so it can't be promoted on no record.
+ * Also fixed: a transaction moving two different tokens attributed its FULL
+ * SOL leg to each mint. The leg is now split across the mints it touched.
  *
- * Also fixed: the snipe cutoff compared a buy against the oldest transaction
- * FETCHED, not the coin's first trade, so on high-volume coins it silently
- * excluded genuine early buyers. It now only applies when the harvester
- * actually paged back to the start of the coin's history.
- *
- * Dashboard now shows a rejection tally and near-misses so miscalibration is
- * visible without reading db.json.
  * This service NEVER trades. It only reads the chain.
  */
 
@@ -59,11 +56,16 @@ const CFG = {
   DATA_DIR: process.env.DATA_DIR || "/data",
 
   /* v4 vetting calibration */
-  MAX_FAST_PCT: Number(process.env.MAX_FAST_PCT || 40),        // was hardcoded 10
-  PATIENT_HOLD_MIN: Number(process.env.PATIENT_HOLD_MIN || 60), // median hold that excuses fast exits
-  MIN_DAYS: Number(process.env.MIN_DAYS || 4),                  // below this, consistency is unmeasurable
+  MAX_FAST_PCT: Number(process.env.MAX_FAST_PCT || 40),
+  PATIENT_HOLD_MIN: Number(process.env.PATIENT_HOLD_MIN || 60),
+  MIN_DAYS: Number(process.env.MIN_DAYS || 4),
   MIN_GREEN_RATIO: Number(process.env.MIN_GREEN_RATIO || 0.4),
-  MAX_MINT_EVENTS: Number(process.env.MAX_MINT_EVENTS || 3),    // deployer tolerance
+  MAX_MINT_EVENTS: Number(process.env.MAX_MINT_EVENTS || 3),
+
+  /* v5 */
+  MIN_ROI_PCT: Number(process.env.MIN_ROI_PCT || 10),      // realised / matched cost
+  MAX_TXS_30D: Number(process.env.MAX_TXS_30D || 1500),    // raw activity ceiling
+  CLOSE_TOLERANCE: Number(process.env.CLOSE_TOLERANCE || 0.05), // ≤5% left = closed
 };
 
 const SOL_MINT = "So11111111111111111111111111111111111111112";
@@ -165,6 +167,90 @@ function solLeg(tx, wallet) {
   return { paid, recv };
 }
 
+/* v5: net token movement per mint for this wallet in one transaction.
+   Multiple transfers of the same mint collapse into one delta, so the SOL
+   leg is never counted twice. */
+function mintDeltas(tx, wallet) {
+  const d = {};
+  for (const tr of tx.tokenTransfers || []) {
+    if (!tr.mint || QUOTES.has(tr.mint)) continue;
+    const amt = Math.abs(Number(tr.tokenAmount || 0));
+    if (!amt) continue;
+    if (tr.toUserAccount === wallet) d[tr.mint] = (d[tr.mint] || 0) + amt;
+    else if (tr.fromUserAccount === wallet) d[tr.mint] = (d[tr.mint] || 0) - amt;
+  }
+  for (const k of Object.keys(d)) if (!d[k]) delete d[k];
+  return d;
+}
+
+/* v5: build per-mint lots (quantity + SOL) from a wallet's transactions. */
+function buildLedger(txs, wallet) {
+  const perMint = {};
+  let airdropped = 0;
+  for (const tx of txs) {
+    const { paid, recv } = solLeg(tx, wallet);
+    const deltas = Object.entries(mintDeltas(tx, wallet));
+    if (!deltas.length) continue;
+    const bought = deltas.filter(([, q]) => q > 0);
+    const sold = deltas.filter(([, q]) => q < 0);
+
+    if (bought.length) {
+      const each = paid / bought.length;          // split the leg across mints
+      for (const [mint, qty] of bought) {
+        const m = (perMint[mint] ||= { buys: [], sells: [] });
+        if (each > 0.002) m.buys.push({ ts: tx.timestamp, qty, sol: each });
+        else airdropped++;
+      }
+    }
+    if (sold.length) {
+      const each = recv / sold.length;
+      for (const [mint, qty] of sold) {
+        const m = (perMint[mint] ||= { buys: [], sells: [] });
+        if (each > 0.002) m.sells.push({ ts: tx.timestamp, qty: -qty, sol: each });
+      }
+    }
+  }
+  return { perMint, airdropped };
+}
+
+/* v5: FIFO-match one mint's sells against its buys, by QUANTITY. */
+function matchFIFO(m) {
+  const buys = m.buys.slice().sort((a, b) => a.ts - b.ts).map((b) => ({ ...b, left: b.qty }));
+  const sells = m.sells.slice().sort((a, b) => a.ts - b.ts);
+  let realised = 0, matchedCost = 0, matchedQty = 0, unmatchedQty = 0;
+  const holds = [];
+  let lastSellTs = null;
+
+  for (const s of sells) {
+    if (!s.qty) continue;
+    const perUnitOut = s.sol / s.qty;
+    let need = s.qty;
+    for (const b of buys) {
+      if (need <= 0) break;
+      if (!b.left || b.ts > s.ts) continue;
+      const take = Math.min(b.left, need);
+      const perUnitIn = b.sol / b.qty;
+      realised += take * (perUnitOut - perUnitIn);
+      matchedCost += take * perUnitIn;
+      matchedQty += take;
+      holds.push((s.ts - b.ts) / 60);
+      b.left -= take;
+      need -= take;
+      lastSellTs = s.ts;
+    }
+    if (need > 0) unmatchedQty += need;           // sold a bag bought before the window
+  }
+
+  const boughtQty = buys.reduce((t, b) => t + b.qty, 0);
+  const openQty = buys.reduce((t, b) => t + b.left, 0);
+  const closed = boughtQty > 0 && openQty <= boughtQty * CFG.CLOSE_TOLERANCE;
+  return {
+    realised, matchedCost, matchedQty, unmatchedQty, openQty, boughtQty,
+    closed, holds, lastSellTs,
+    firstBuy: buys.length ? buys[0].ts : null,
+  };
+}
+
 /* ── DISCOVERY A: trending coins ────────────────────────── */
 
 async function discoverTrending() {
@@ -244,10 +330,10 @@ async function discoverExpansion() {
 /* ── HARVEST: patient winners on a coin ─────────────────── */
 
 async function harvestCoin(coin) {
-  const traders = {};
+  const traders = {};                    // wallet -> { buys:[], sells:[] } for THIS mint
   let before = "";
   let firstSeen = null;
-  let reachedStart = false;          // v4: did we actually page back to the coin's first trade?
+  let reachedStart = false;
   for (let page = 0; page < CFG.COIN_PAGES; page++) {
     status = `harvest ${coin.name} page ${page + 1}`;
     let batch;
@@ -256,17 +342,20 @@ async function harvestCoin(coin) {
     if (!batch.length) { reachedStart = true; break; }
     for (const tx of batch) {
       if (firstSeen === null || tx.timestamp < firstSeen) firstSeen = tx.timestamp;
+      const movers = new Set();
       for (const tr of tx.tokenTransfers || []) {
         if (tr.mint !== coin.mint) continue;
-        const buyer = tr.toUserAccount, seller = tr.fromUserAccount;
-        if (buyer && !QUOTES.has(buyer) && !PROGRAMS.has(buyer)) {
-          const { paid } = solLeg(tx, buyer);
-          if (paid >= CFG.MIN_BUY_SOL) (traders[buyer] ||= { buys: [], sells: [] }).buys.push({ ts: tx.timestamp, sol: paid });
-        }
-        if (seller && !QUOTES.has(seller) && !PROGRAMS.has(seller)) {
-          const { recv } = solLeg(tx, seller);
-          if (recv >= CFG.MIN_BUY_SOL) (traders[seller] ||= { buys: [], sells: [] }).sells.push({ ts: tx.timestamp, sol: recv });
-        }
+        if (tr.toUserAccount) movers.add(tr.toUserAccount);
+        if (tr.fromUserAccount) movers.add(tr.fromUserAccount);
+      }
+      for (const w of movers) {
+        if (QUOTES.has(w) || PROGRAMS.has(w)) continue;
+        const d = mintDeltas(tx, w)[coin.mint];
+        if (!d) continue;
+        const { paid, recv } = solLeg(tx, w);
+        const t = (traders[w] ||= { buys: [], sells: [] });
+        if (d > 0 && paid >= CFG.MIN_BUY_SOL) t.buys.push({ ts: tx.timestamp, qty: d, sol: paid });
+        if (d < 0 && recv >= CFG.MIN_BUY_SOL) t.sells.push({ ts: tx.timestamp, qty: -d, sol: recv });
       }
     }
     before = batch[batch.length - 1].signature;
@@ -274,20 +363,15 @@ async function harvestCoin(coin) {
   }
 
   const winners = [];
-  for (const [w, b] of Object.entries(traders)) {
-    if (!b.buys.length || !b.sells.length) continue;
-    const firstBuy = Math.min(...b.buys.map((x) => x.ts));
-    const sellsAfter = b.sells.filter((s) => s.ts >= firstBuy);
-    if (!sellsAfter.length) continue;                       // matched round trips only
-    const lastSell = Math.max(...sellsAfter.map((x) => x.ts));
-    const buySol = b.buys.reduce((s, x) => s + x.sol, 0);
-    const sellSol = sellsAfter.reduce((s, x) => s + x.sol, 0);
-    const holdMin = (lastSell - firstBuy) / 60;
-    // v4: only a genuine snipe if we can see the coin's actual beginning
-    if (reachedStart && firstSeen !== null && firstBuy - firstSeen <= CFG.SNIPE_CUTOFF_S) continue;
+  for (const [w, m] of Object.entries(traders)) {
+    if (!m.buys.length || !m.sells.length) continue;
+    const r = matchFIFO(m);                          // v5: quantity-matched
+    if (!r.matchedQty || r.realised <= 0) continue;
+    if (r.matchedCost > 0 && r.realised / r.matchedCost < 0.05) continue;
+    const holdMin = r.holds.length ? r.holds.reduce((a, b) => a + b, 0) / r.holds.length : 0;
+    if (reachedStart && firstSeen !== null && r.firstBuy - firstSeen <= CFG.SNIPE_CUTOFF_S) continue;
     if (holdMin < CFG.MIN_HOLD_MIN) continue;
-    if (sellSol <= buySol * 1.05) continue;
-    winners.push({ wallet: w, profitSol: +(sellSol - buySol).toFixed(3), holdMin: Math.round(holdMin) });
+    winners.push({ wallet: w, profitSol: +r.realised.toFixed(3), holdMin: Math.round(holdMin) });
   }
   winners.sort((a, b) => b.profitSol - a.profitSol);
   DB.seenCoins[coin.mint] = now();
@@ -336,68 +420,65 @@ async function vetWallet(wallet) {
   if (txs.length < 5) return null;
   txs.sort((a, b) => a.timestamp - b.timestamp);
   const lastActiveTs = txs[txs.length - 1].timestamp;
+  const txCount = txs.length;
 
-  const perMint = {};
-  let airdropped = 0;
-  let mintEvents = 0;   // v4: deployer signal
+  let mintEvents = 0;
   for (const tx of txs) {
     if (tx.feePayer === wallet && MINT_TYPES.has(String(tx.type || ""))) mintEvents++;
-    const { paid, recv } = solLeg(tx, wallet);
-    for (const tr of tx.tokenTransfers || []) {
-      if (!tr.mint || QUOTES.has(tr.mint)) continue;
-      if (!Math.abs(Number(tr.tokenAmount || 0))) continue;
-      if (tr.toUserAccount === wallet) {
-        const m = (perMint[tr.mint] ||= { buys: [], sells: [] });
-        if (paid > 0.002) m.buys.push({ ts: tx.timestamp, sol: paid }); else airdropped++;
-      } else if (tr.fromUserAccount === wallet) {
-        const m = (perMint[tr.mint] ||= { buys: [], sells: [] });
-        if (recv > 0.002) m.sells.push({ ts: tx.timestamp, sol: recv });
-      }
-    }
   }
 
-  /* only MATCHED round trips — first buy in window, sells after it.
-     Sells with no in-window buy are excluded and counted separately. */
+  const { perMint, airdropped } = buildLedger(txs, wallet);
+
+  /* v5: quantity-matched round trips */
   const positions = [];
   let unmatchedSells = 0;
   let openPositions = 0;
+  let realisedTotal = 0;
+  let matchedCostTotal = 0;
+  const allHolds = [];
+
   for (const [mint, m] of Object.entries(perMint)) {
     if (!m.buys.length) {
       if (m.sells.length) unmatchedSells += m.sells.length;
       continue;
     }
-    const firstBuy = Math.min(...m.buys.map((b) => b.ts));
-    const sellsAfter = m.sells.filter((s) => s.ts >= firstBuy);
-    const sellsBefore = m.sells.length - sellsAfter.length;
-    if (sellsBefore) unmatchedSells += sellsBefore;
-    const buySol = m.buys.reduce((s, b) => s + b.sol, 0);
-    const sellSol = sellsAfter.reduce((s, x) => s + x.sol, 0);
-    const closed = sellsAfter.length > 0;
-    if (!closed) openPositions++;
-    const lastSell = closed ? Math.max(...sellsAfter.map((s) => s.ts)) : null;
+    const r = matchFIFO(m);
+    if (r.unmatchedQty > 0) unmatchedSells++;
+    if (!r.closed) openPositions++;
+    if (r.matchedQty > 0) {
+      realisedTotal += r.realised;
+      matchedCostTotal += r.matchedCost;
+      allHolds.push(...r.holds);
+    }
     positions.push({
-      mint, buySol, sellSol, closed,
-      pnl: closed ? sellSol - buySol : 0,
-      holdMin: closed ? (lastSell - firstBuy) / 60 : null,
-      firstBuy,
+      mint,
+      matched: r.matchedQty > 0,
+      closed: r.closed,
+      pnl: r.realised,
+      cost: r.matchedCost,
+      holdMin: r.holds.length ? r.holds.reduce((a, b) => a + b, 0) / r.holds.length : null,
+      firstBuy: r.firstBuy,
+      buySol: m.buys.reduce((t, b) => t + b.sol, 0),
     });
   }
   if (!positions.length) return null;
 
-  const closed = positions.filter((p) => p.closed);
-  if (closed.length < CFG.MIN_MATCHED) return null;   // need real round trips
+  const closed = positions.filter((p) => p.closed && p.matched);
+  if (closed.length < CFG.MIN_MATCHED) return null;
 
   const wins = closed.filter((p) => p.pnl > 0);
-  const totalPnl = closed.reduce((s, p) => s + p.pnl, 0);
-  const holds = closed.map((p) => p.holdMin).sort((a, b) => a - b);
-  const medHold = holds[Math.floor(holds.length / 2)];
-  const fastPct = (closed.filter((p) => p.holdMin < 1 / 12).length / closed.length) * 100;
   const winRate = (wins.length / closed.length) * 100;
+  const holds = allHolds.slice().sort((a, b) => a - b);
+  const medHold = holds.length ? holds[Math.floor(holds.length / 2)] : 0;
+  const fastPct = holds.length
+    ? (holds.filter((h) => h < 1 / 12).length / holds.length) * 100 : 0;
+  const roiPct = matchedCostTotal > 0 ? (realisedTotal / matchedCostTotal) * 100 : 0;
   const sizes = positions.map((p) => p.buySol).sort((a, b) => a - b);
   const medSize = sizes[Math.floor(sizes.length / 2)];
 
   const byDay = {};
   for (const p of closed) {
+    if (!p.firstBuy) continue;
     const d = new Date(p.firstBuy * 1000).toISOString().slice(0, 10);
     byDay[d] = (byDay[d] || 0) + p.pnl;
   }
@@ -405,7 +486,7 @@ async function vetWallet(wallet) {
   const greenDays = days.filter((v) => v > 0).length;
   const thinHistory = days.length < CFG.MIN_DAYS;
 
-  const recentMints = positions.slice().sort((a, b) => b.firstBuy - a.firstBuy).map((p) => p.mint);
+  const recentMints = positions.slice().sort((a, b) => (b.firstBuy || 0) - (a.firstBuy || 0)).map((p) => p.mint);
   status = `vet ${wallet.slice(0, 6)}… liquidity`;
   const liq = (await liquiditySample(recentMints)).filter((v) => v > 0).sort((a, b) => a - b);
   const medLiq = liq.length ? liq[Math.floor(liq.length / 2)] : 0;
@@ -415,36 +496,34 @@ async function vetWallet(wallet) {
 
   add("hold duration", medHold >= CFG.MIN_HOLD_MIN, `median ${medHold.toFixed(0)}m`);
 
-  // v4: fast exits only condemn a wallet that ALSO flips quickly on the median
   const scalping = fastPct > CFG.MAX_FAST_PCT && medHold < CFG.PATIENT_HOLD_MIN;
   add("not a scalper", !scalping,
     `${fastPct.toFixed(0)}% exits <5s${fastPct > CFG.MAX_FAST_PCT && !scalping ? ` (excused, ${medHold.toFixed(0)}m median)` : ""}`);
 
   add("human pace", positions.length <= CFG.MAX_TOKENS, `${positions.length} tokens/${CFG.VET_DAYS}d`);
+  add("not a machine", txCount <= CFG.MAX_TXS_30D,
+    `${txCount} txs/${CFG.VET_DAYS}d (~${Math.round(txCount / CFG.VET_DAYS)}/day)`);
   add("win rate band", winRate >= CFG.MIN_WR && winRate <= CFG.MAX_WR, `${winRate.toFixed(0)}%`);
-  add("profitable", totalPnl > 0, `${totalPnl >= 0 ? "+" : ""}${totalPnl.toFixed(2)} SOL matched`);
+  add("profitable", realisedTotal > 0, `${realisedTotal >= 0 ? "+" : ""}${realisedTotal.toFixed(2)} SOL matched`);
+  add("worthwhile edge", roiPct >= CFG.MIN_ROI_PCT,
+    `${roiPct.toFixed(1)}% on ${matchedCostTotal.toFixed(1)} SOL deployed`);
   add("tradeable liquidity", medLiq >= CFG.MIN_LIQ_USD, `median pool $${Math.round(medLiq).toLocaleString()}`);
-
-  // v4: unmeasurable on a thin sample — skipped, not failed
   add("consistent",
     greenDays / Math.max(days.length, 1) >= CFG.MIN_GREEN_RATIO,
     thinHistory ? `only ${days.length}d observed — not scored` : `${greenDays}/${days.length} green days`,
     thinHistory);
-
-  // v4: replaces the old airdrop-ratio check, which punished inbound spam
   add("not a deployer", mintEvents < CFG.MAX_MINT_EVENTS,
     mintEvents ? `${mintEvents} mint/pool txs` : "no mints or pools created");
 
   const scored = checks.filter((c) => !c.skip);
   const passed = scored.filter((c) => c.pass).length;
   const failedChecks = scored.filter((c) => !c.pass).map((c) => c.name);
-  const critical = ["hold duration", "not a scalper", "profitable"];
+  const critical = ["hold duration", "not a scalper", "profitable", "worthwhile edge"];
   const criticalFail = scored.some((c) => critical.includes(c.name) && !c.pass);
 
   let verdict = criticalFail ? "REJECT"
     : passed >= scored.length - 1 ? "FOLLOW"
     : passed >= scored.length - 3 ? "WATCH" : "REJECT";
-  // a wallet we've barely observed cannot be promoted, however well it scores
   if (verdict === "FOLLOW" && thinHistory) verdict = "WATCH";
 
   return {
@@ -453,7 +532,11 @@ async function vetWallet(wallet) {
     dormant: now() - lastActiveTs > CFG.DORMANT_DAYS * DAY,
     stats: {
       tokens: positions.length, closed: closed.length, openPositions, unmatchedSells,
-      winRatePct: +winRate.toFixed(1), realisedSol: +totalPnl.toFixed(3),
+      txCount,
+      winRatePct: +winRate.toFixed(1),
+      realisedSol: +realisedTotal.toFixed(3),
+      matchedCostSol: +matchedCostTotal.toFixed(2),
+      roiPct: +roiPct.toFixed(1),
       medianHoldMin: +medHold.toFixed(1), fastFlipPct: +fastPct.toFixed(1),
       medianPositionSol: +medSize.toFixed(3),
       medianPoolUsd: Math.round(medLiq), greenDays, totalDays: days.length,
@@ -528,7 +611,7 @@ async function cycle() {
         if (!card) { logLine(`  ${w.slice(0, 6)}… skipped (too few matched round trips)`); continue; }
         storeCard(card, `${meta.via} · ${meta.hits} coin(s)`);
         const why = card.failedChecks.length ? ` — failed: ${card.failedChecks.join(", ")}` : "";
-        logLine(`  ${w.slice(0, 6)}… ${card.verdict} (${card.passed}/${card.checksTotal}) ${card.stats.realisedSol >= 0 ? "+" : ""}${card.stats.realisedSol} SOL${why}`);
+        logLine(`  ${w.slice(0, 6)}… ${card.verdict} (${card.passed}/${card.checksTotal}) ${card.stats.realisedSol >= 0 ? "+" : ""}${card.stats.realisedSol} SOL @ ${card.stats.roiPct}% ROI${why}`);
       } catch (e) { logLine(`  ${w.slice(0, 6)}… vet failed: ${e.message}`); }
     }
 
@@ -579,10 +662,9 @@ function renderPage() {
   const watches = all.filter((w) => w.verdict === "WATCH" && !w.dormant);
   const dormant = all.filter((w) => w.dormant && w.verdict !== "REJECT");
   const nearMiss = all.filter((w) => w.verdict === "REJECT" && !w.dormant
-    && w.passed >= (w.checksTotal || 8) - 2).slice(0, 8);
+    && w.passed >= (w.checksTotal || 10) - 2).slice(0, 8);
   const promoteList = follows.map((w) => w.wallet).join(",");
 
-  // v4: which checks are doing the rejecting, across everything vetted
   const tally = {};
   for (const w of all) {
     for (const c of w.checks || []) {
@@ -608,9 +690,9 @@ function renderPage() {
 
   const row = (w) => `<li class="row ${w.verdict.toLowerCase()}"><div class="body">
     <div class="head"><span class="sym">${esc(w.wallet.slice(0, 6))}…${esc(w.wallet.slice(-4))}</span>
-      <span class="x">${w.verdict} ${w.passed}/${w.checksTotal || 8}${trendMark(w.trend)}</span></div>
-    <div class="meta">${w.stats.realisedSol >= 0 ? "+" : ""}${w.stats.realisedSol} SOL matched · ${w.stats.winRatePct}% win · hold ${w.stats.medianHoldMin}m · ${w.stats.closed} round trips · pool $${w.stats.medianPoolUsd.toLocaleString()}</div>
-    <div class="meta">${w.stats.tokens} tokens · ${w.stats.openPositions || 0} still open · ${w.stats.unmatchedSells || 0} sells outside window · median size ${w.stats.medianPositionSol || "?"} SOL</div>
+      <span class="x">${w.verdict} ${w.passed}/${w.checksTotal || 10}${trendMark(w.trend)}</span></div>
+    <div class="meta">${w.stats.realisedSol >= 0 ? "+" : ""}${w.stats.realisedSol} SOL on ${w.stats.matchedCostSol ?? "?"} deployed · <b>${w.stats.roiPct ?? "?"}% ROI</b> · ${w.stats.winRatePct}% win · hold ${w.stats.medianHoldMin}m</div>
+    <div class="meta">${w.stats.closed} closed round trips · ${w.stats.tokens} tokens · ${w.stats.txCount ?? "?"} txs · pool $${w.stats.medianPoolUsd.toLocaleString()} · median size ${w.stats.medianPositionSol || "?"} SOL</div>
     ${(w.failedChecks && w.failedChecks.length) ? `<div class="meta fail">failed: ${esc(w.failedChecks.join(", "))}</div>` : ""}
     <div class="meta">via ${esc(w.provenance || "?")} · vetted ${ago(w.vettedAt)} · last traded ${ago(w.lastActiveTs)}</div>
     <div class="meta mono">${esc(w.wallet)}</div>
@@ -649,6 +731,7 @@ function renderPage() {
   .row.watch .x{color:var(--amber)}
   .row.reject .x{color:var(--clay)}
   .meta{color:var(--slate);font-size:10.5px;margin-top:2px}
+  .meta b{color:var(--ink)}
   .meta.fail{color:var(--clay)}
   .mono{word-break:break-all;font-size:9.5px;user-select:all}
   .none{color:var(--slate);font-size:12px;padding:12px;background:var(--panel);border:1px dashed var(--edge)}
@@ -664,13 +747,13 @@ function renderPage() {
 </style></head><body>
   <h1>Wallet <em>hunter</em></h1>
   <div class="sub">
-    v4 · calibrated vetting · alternating TRENDING / EXPANSION · cycle ${CFG.CYCLE_MINUTES}m · vet ${CFG.MAX_VET_PER_CYCLE}/cycle ·
-    filters: hold ≥${CFG.MIN_HOLD_MIN}m · fast exits ≤${CFG.MAX_FAST_PCT}% (unless median ≥${CFG.PATIENT_HOLD_MIN}m) ·
-    win ${CFG.MIN_WR}-${CFG.MAX_WR}% · pool ≥$${CFG.MIN_LIQ_USD.toLocaleString()} · ≥${CFG.MIN_MATCHED} round trips ·
+    v5 · quantity-matched FIFO accounting · alternating TRENDING / EXPANSION · cycle ${CFG.CYCLE_MINUTES}m · vet ${CFG.MAX_VET_PER_CYCLE}/cycle ·
+    filters: hold ≥${CFG.MIN_HOLD_MIN}m · ROI ≥${CFG.MIN_ROI_PCT}% · ≤${CFG.MAX_TXS_30D} txs/${CFG.VET_DAYS}d ·
+    win ${CFG.MIN_WR}-${CFG.MAX_WR}% · pool ≥$${CFG.MIN_LIQ_USD.toLocaleString()} ·
     ${persistOk ? "database saved ✓" : "IN MEMORY ONLY"} · <a href="/db.json" style="color:var(--green)">db.json</a>
   </div>
   <div class="status">▶ ${esc(status)}<br>cycles: ${DB.cycles} (last ${DB.lastMode || "—"}, ${ago(DB.lastCycleAt)}) · coins scanned: ${Object.keys(DB.seenCoins).length} · wallets known: ${all.length}
-  <div class="note">SOL figures count only round trips that opened inside the ${CFG.VET_DAYS}-day window. Wallets holding longer than that will read lower than GMGN — check there before promoting. Wallets with fewer than ${CFG.MIN_DAYS} observed days cannot be promoted above WATCH.</div></div>
+  <div class="note">Profit counts only quantity that was bought AND sold inside the ${CFG.VET_DAYS}-day window, at that quantity's real cost basis. Unsold bags are excluded, not banked. ROI is the number that matters at a fixed stake — a huge SOL figure at 1% ROI is a volume grind you cannot copy.</div></div>
   ${promoteList ? `<div class="promote"><b>Copy into FOLLOW_WALLETS (paper first)</b><div class="val">${esc(promoteList)}</div></div>` : ""}
   <div class="cards">
     <div class="card"><b style="color:var(--green)">${follows.length}</b><span>follow</span></div>
@@ -710,7 +793,7 @@ http.createServer((req, res) => {
   res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
   res.end(renderPage());
 }).listen(CFG.PORT, () => {
-  console.log(`Wallet hunter v4 on ${CFG.PORT} — persistence ${persistOk ? "ON" : "OFF"}`);
+  console.log(`Wallet hunter v5 on ${CFG.PORT} — persistence ${persistOk ? "ON" : "OFF"}`);
   if (!CFG.KEY) { status = "FAILED: HELIUS_API_KEY not set"; return; }
   cycle();
   setInterval(cycle, CFG.CYCLE_MINUTES * 60 * 1000);
