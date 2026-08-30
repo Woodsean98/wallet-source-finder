@@ -1,17 +1,13 @@
 /**
- * CONFLUENCE TRADER v5.0 — FOLLOW MODE
- * ------------------------------------
- * New: FOLLOW_WALLETS — patient swing wallets followed 1:1.
- *  - Their BUY opens a paper follow position immediately (stake FOLLOW_PAPER_SOL).
- *  - If FOLLOW_LIVE=true AND live is armed: also buys live (FOLLOW_POSITION_SOL).
- *  - Exits: their sell · trail (TRAIL_ARM/TRAIL_RETRACE) · corpse
- *    (<FOLLOW_CORPSE_MULT after FOLLOW_CORPSE_MIN) · FOLLOW_MAX_HOLD_MIN cap.
- *    No micro-trail / no-momentum (wrong shape for swing holds).
- *  - Follow book persists (/data) and exports in /book.csv as book="follow".
- * Old FHpc confluence engine remains but sleeps if WATCH_WALLETS is empty.
- * Env (new): FOLLOW_WALLETS (default HcyZ…Edj5), FOLLOW_LIVE (false),
- *   FOLLOW_POSITION_SOL (0.15), FOLLOW_PAPER_SOL (0.3),
- *   FOLLOW_MAX_HOLD_MIN (720), FOLLOW_CORPSE_MIN (30), FOLLOW_CORPSE_MULT (0.75)
+ * CONFLUENCE TRADER v5.1 — FOLLOW MODE + PER-WALLET PAPER FLAG
+ * ------------------------------------------------------------
+ * v5.0 + PAPER_ONLY_WALLETS: addresses listed there are followed on paper
+ * only and NEVER trade live, even when FOLLOW_LIVE=true and live is armed.
+ * Use it to audition a wallet risk-free alongside live ones.
+ *
+ * FOLLOW_WALLETS      — every wallet to follow (paper book always)
+ * PAPER_ONLY_WALLETS  — subset of the above that must never go live
+ * FOLLOW_LIVE         — master switch for live follow buys (default false)
  */
 
 import http from "http";
@@ -27,6 +23,8 @@ const CONFIG = {
   MONITOR_WALLETS: (process.env.MONITOR_WALLETS || "")
     .split(",").map((s) => s.trim()).filter(Boolean),
   FOLLOW_WALLETS: (process.env.FOLLOW_WALLETS || "HcyZxKEeLV7hc2MMWBuJmb1Z2C4E5CVKAiUiGzdCEdj5")
+    .split(",").map((s) => s.trim()).filter(Boolean),
+  PAPER_ONLY_WALLETS: (process.env.PAPER_ONLY_WALLETS || "")
     .split(",").map((s) => s.trim()).filter(Boolean),
   FOLLOW_LIVE: (process.env.FOLLOW_LIVE || "false") === "true",
   FOLLOW_POSITION_SOL: Number(process.env.FOLLOW_POSITION_SOL || 0.15),
@@ -74,6 +72,8 @@ const CONFIG = {
   LIVE_FEE_EST: Number(process.env.LIVE_FEE_EST_SOL || 0.0045),
   DATA_DIR: process.env.DATA_DIR || "/data",
 };
+
+const isPaperOnly = (w) => CONFIG.PAPER_ONLY_WALLETS.includes(w);
 
 const SOL_MINT = "So11111111111111111111111111111111111111112";
 const QUOTE_MINTS = new Set([
@@ -230,7 +230,7 @@ const recentBuys = [];
 let webhookHits = 0;
 const followDebug = [];
 
-const followOpen = new Map();                       // paper follow positions
+const followOpen = new Map();
 const followClosed = loadClosed(FOLLOW_FILE, 400);
 
 const liveOpen = new Map();
@@ -478,23 +478,25 @@ async function liveSell(mint, reason, attempt = 1) {
   }
 }
 
-/* ── follow engine (paper) ──────────────────────────────── */
+/* ── follow engine ──────────────────────────────────────── */
 
 async function openFollow(wallet, mint, sizeSol) {
   if (followOpen.has(mint)) return;
+  const paperOnly = isPaperOnly(wallet);
   const px = await fetchPriceSol(mint);
   if (!px) { console.log(`FOLLOW skip ${mint} — no entry price`); return; }
   const entryPrice = px * (1 + CONFIG.SLIPPAGE);
   const tokens = CONFIG.FOLLOW_PAPER_SOL / entryPrice;
   followOpen.set(mint, {
-    mint, wallet, entryPrice, tokens, theirSize: sizeSol || 0,
+    mint, wallet, entryPrice, tokens, theirSize: sizeSol || 0, paperOnly,
     openedAt: now(), peakPrice: px, trailArmed: false,
   });
+  const goingLive = CONFIG.FOLLOW_LIVE && !paperOnly;
   sendTelegram(
     `👣 <b>FOLLOW</b> ${short(wallet)} bought ${sizeSol ? sizeSol.toFixed(2) : "?"} SOL\n\n<code>${mint}</code>\n` +
-    `paper in ${CONFIG.FOLLOW_PAPER_SOL} SOL${CONFIG.FOLLOW_LIVE && liveArmed ? ` · live in ${CONFIG.FOLLOW_POSITION_SOL} SOL` : " · live OFF"}\n📊 dexscreener.com/solana/${mint}`
+    `paper in ${CONFIG.FOLLOW_PAPER_SOL} SOL${goingLive ? ` · live in ${CONFIG.FOLLOW_POSITION_SOL} SOL` : paperOnly ? " · PAPER ONLY wallet" : " · live OFF"}\n📊 dexscreener.com/solana/${mint}`
   );
-  if (CONFIG.FOLLOW_LIVE) executeLiveBuy(mint, CONFIG.FOLLOW_POSITION_SOL, `follow ${short(wallet)}`);
+  if (goingLive) executeLiveBuy(mint, CONFIG.FOLLOW_POSITION_SOL, `follow ${short(wallet)}`);
 }
 
 function closeFollow(mint, reason, exitRaw, unpriced = false) {
@@ -506,7 +508,7 @@ function closeFollow(mint, reason, exitRaw, unpriced = false) {
   const pnlSol = unpriced ? 0 : +(proceeds - CONFIG.FOLLOW_PAPER_SOL).toFixed(4);
   const mult = !unpriced && pos.entryPrice > 0 ? +(exitPrice / pos.entryPrice).toFixed(3) : 0;
   const rec = {
-    mint, wallet: pos.wallet, reason,
+    mint, wallet: pos.wallet, reason, paperOnly: !!pos.paperOnly,
     heldMin: Math.round((now() - pos.openedAt) / 60),
     mult, peakMult: pos.entryPrice > 0 ? +(pos.peakPrice / pos.entryPrice).toFixed(2) : 0,
     pnlSol, theirSize: pos.theirSize, closedAt: now(), unpriced,
@@ -538,15 +540,25 @@ function stats() {
   };
 }
 
-function followStats() {
-  const priced = followClosed.filter((t) => !t.unpriced);
+function followStatsFor(filterFn) {
+  const priced = followClosed.filter((t) => !t.unpriced && filterFn(t));
   const wins = priced.filter((t) => t.pnlSol > 0).length;
   const totalPnl = priced.reduce((s, t) => s + t.pnlSol, 0);
   return {
-    open: followOpen.size, closed: priced.length, wins,
+    closed: priced.length, wins,
     winRate: priced.length ? Math.round((wins / priced.length) * 100) : 0,
     totalPnlSol: +totalPnl.toFixed(4),
   };
+}
+
+function perWalletStats() {
+  const out = [];
+  for (const w of CONFIG.FOLLOW_WALLETS) {
+    const s = followStatsFor((t) => t.wallet === w);
+    out.push({ wallet: w, paperOnly: isPaperOnly(w), ...s,
+      open: [...followOpen.values()].filter((p) => p.wallet === w).length });
+  }
+  return out;
 }
 
 function liveStats() {
@@ -615,7 +627,7 @@ setInterval(async () => {
   }
 }, CONFIG.SETTLE_INTERVAL_MS);
 
-/* FAST loop (15s): confluence exits + follow trail + live exits */
+/* FAST loop (15s) */
 setInterval(async () => {
   const tNow = now();
   const nomoCutoff = tNow - CONFIG.NOMO_MIN * 60;
@@ -671,7 +683,7 @@ setInterval(async () => {
   }
 }, 15_000);
 
-/* slow sweep (60s): corpse cuts + timeouts + balance */
+/* slow sweep (60s) */
 setInterval(async () => {
   const tNow = now();
   const holdCutoff = tNow - CONFIG.MAX_HOLD_MIN * 60;
@@ -704,8 +716,8 @@ setInterval(async () => {
       closeFollow(mint, "corpse cut", px);
       if (liveOpen.has(mint)) liveSell(mint, "corpse cut");
     } else if (pos.openedAt < fHoldCutoff) {
-      await closeFollowWithPrice(mint, "12h timeout");
-      if (liveOpen.has(mint)) liveSell(mint, "12h timeout");
+      await closeFollowWithPrice(mint, "hold timeout");
+      if (liveOpen.has(mint)) liveSell(mint, "hold timeout");
     }
   }
 
@@ -721,7 +733,7 @@ setInterval(async () => {
     if (m !== null && pos.openedAt < cCut && m < cMult) {
       liveSell(mint, "corpse cut");
     } else if (pos.openedAt < hCut) {
-      liveSell(mint, isFollow ? "12h timeout" : "timeout");
+      liveSell(mint, isFollow ? "hold timeout" : "timeout");
     }
   }
 
@@ -891,8 +903,11 @@ function handleWebhookPayload(payload) {
       if (buy) { openFollow(wallet, buy.mint, buy.sizeSol || 0); continue; }
       const sell = extractSell(tx, wallet);
       if (sell && followOpen.has(sell.mint)) {
-        closeFollowWithPrice(sell.mint, `${short(wallet)} sold`);
-        if (liveOpen.has(sell.mint)) liveSell(sell.mint, `${short(wallet)} sold`);
+        const pos = followOpen.get(sell.mint);
+        if (pos.wallet === wallet) {
+          closeFollowWithPrice(sell.mint, `${short(wallet)} sold`);
+          if (liveOpen.has(sell.mint)) liveSell(sell.mint, `${short(wallet)} sold`);
+        }
       }
     }
 
@@ -921,7 +936,9 @@ const esc = (s) =>
 
 function renderPage() {
   const s = stats();
-  const fsx = followStats();
+  const allFollow = followStatsFor(() => true);
+  const liveFollow = followStatsFor((t) => !t.paperOnly);
+  const paperFollow = followStatsFor((t) => t.paperOnly);
   const ls = liveStats();
   const night = nightWindow();
   const fmtAgo = (ts) => {
@@ -935,9 +952,9 @@ function renderPage() {
   if (liveArmed && night) {
     liveBanner = `<div class="banner ready">🌙 LIVE armed but PAUSED — night window ${CONFIG.NIGHT_START}:00-${CONFIG.NIGHT_END}:00 UK.</div>`;
   } else if (liveArmed) {
-    liveBanner = `<div class="banner armed">🔴 LIVE ARMED — follow live ${CONFIG.FOLLOW_LIVE ? `ON (${CONFIG.FOLLOW_POSITION_SOL} SOL/trade)` : "OFF (paper only)"} · confluence rule FHpc ≥${CONFIG.FHPC_MIN} · day ${ls.dayPnl >= 0 ? "+" : ""}${ls.dayPnl} SOL · cap −${CONFIG.LIVE_MAX_DAILY_LOSS} · floor ${CONFIG.LIVE_MIN_WALLET} · wallet ${walletSol === null ? "?" : walletSol.toFixed(3)} SOL</div>`;
+    liveBanner = `<div class="banner armed">🔴 LIVE ARMED — follow live ${CONFIG.FOLLOW_LIVE ? `ON (${CONFIG.FOLLOW_POSITION_SOL} SOL/trade)` : "OFF (paper only)"}${CONFIG.PAPER_ONLY_WALLETS.length ? ` · ${CONFIG.PAPER_ONLY_WALLETS.length} wallet(s) paper-only` : ""} · day ${ls.dayPnl >= 0 ? "+" : ""}${ls.dayPnl} SOL · cap −${CONFIG.LIVE_MAX_DAILY_LOSS} · floor ${CONFIG.LIVE_MIN_WALLET} · wallet ${walletSol === null ? "?" : walletSol.toFixed(3)} SOL</div>`;
   } else if (liveReady()) {
-    liveBanner = `<div class="banner ready">⚪️ Live engine ready, DISARMED (${esc(disarmReason)}) · follow live ${CONFIG.FOLLOW_LIVE ? "ON when armed" : "OFF"} · wallet ${walletSol === null ? "?" : walletSol.toFixed(3)} SOL · arm via /arm?key=…</div>`;
+    liveBanner = `<div class="banner ready">⚪️ Live engine ready, DISARMED (${esc(disarmReason)}) · wallet ${walletSol === null ? "?" : walletSol.toFixed(3)} SOL · arm via /arm?key=…</div>`;
   } else {
     const missing = [];
     if (!liveWallet) missing.push(liveWalletError || "WALLET_PRIVATE_KEY or WALLET_SEED_PHRASE");
@@ -949,13 +966,19 @@ function renderPage() {
   const persistBanner = persistOk ? "" :
     `<div class="banner off">⚠️ History NOT persisting — mount a Railway volume at ${esc(CONFIG.DATA_DIR)}.</div>`;
 
+  const walletRows = perWalletStats().map((w) => `<li class="row ${w.paperOnly ? "flat" : "follow"}"><div class="body">
+      <div class="head"><span class="sym">${esc(short(w.wallet))}${w.paperOnly ? " · paper only" : ""}</span>
+        <span class="x" style="color:${w.totalPnlSol >= 0 ? "var(--cyan)" : "var(--clay)"}">${w.totalPnlSol >= 0 ? "+" : ""}${w.totalPnlSol}</span></div>
+      <div class="meta">${w.closed} closed · ${w.winRate}% win · ${w.open} open</div>
+    </div></li>`).join("");
+
   const followOpenRows = [...followOpen.values()].map((p) => {
     const cached = priceCache.get(p.mint);
     const m = cached ? cached.px / p.entryPrice : null;
     const peakX = (p.peakPrice / p.entryPrice).toFixed(2);
-    return `<li class="row follow"><div class="body">
+    return `<li class="row ${p.paperOnly ? "flat" : "follow"}"><div class="body">
       <div class="head"><span class="sym">${esc(short(p.mint))}</span><span class="x">${m ? `${m.toFixed(2)}x · ` : ""}peak ${peakX}x${p.trailArmed ? " · 🎯" : ""}</span></div>
-      <div class="meta">${esc(short(p.wallet))} in ${p.theirSize ? p.theirSize.toFixed(2) : "?"} SOL · opened ${fmtAgo(p.openedAt)} · paper ${CONFIG.FOLLOW_PAPER_SOL}</div>
+      <div class="meta">${esc(short(p.wallet))}${p.paperOnly ? " (paper only)" : ""} in ${p.theirSize ? p.theirSize.toFixed(2) : "?"} SOL · opened ${fmtAgo(p.openedAt)}</div>
       <div class="meta mono">${esc(p.mint)}</div>
     </div></li>`;
   }).join("");
@@ -964,7 +987,7 @@ function renderPage() {
     const cls = t.unpriced ? "flat" : t.pnlSol >= 0 ? "win" : "loss";
     return `<li class="row ${cls}"><div class="body">
       <div class="head"><span class="sym">${esc(short(t.mint))}</span><span class="x">${t.unpriced ? "unpriced" : `${t.mult}x (pk ${t.peakMult}x) · ${t.pnlSol >= 0 ? "+" : ""}${t.pnlSol}`}</span></div>
-      <div class="meta">${fmtAgo(t.closedAt)} · held ${t.heldMin}m · ${esc(t.reason)} · ${esc(short(t.wallet))} in ${t.theirSize ? t.theirSize.toFixed(2) : "?"}</div>
+      <div class="meta">${fmtAgo(t.closedAt)} · held ${t.heldMin}m · ${esc(t.reason)} · ${esc(short(t.wallet))}${t.paperOnly ? " (paper only)" : ""}</div>
       <div class="meta mono">${esc(t.mint)}</div>
     </div></li>`;
   }).join("");
@@ -987,14 +1010,6 @@ function renderPage() {
         <span class="x">${t.mult ? `${t.mult}x (pk ${t.peakMult}x) · ` : ""}${t.pnlSol >= 0 ? "+" : ""}${t.pnlSol} SOL</span></div>
       <div class="meta">${fmtAgo(t.closedAt)} · ${esc(t.reason)}${t.tag ? ` · ${esc(t.tag)}` : ""} · in ${t.solIn.toFixed(3)} → out ${t.solOut.toFixed(3)}</div>
       <div class="meta mono">${esc(t.mint)}</div>
-    </div></li>`;
-  }).join("");
-
-  const sigRows = [...closedTrades].reverse().slice(0, 15).map((t) => {
-    const cls = t.unpriced ? "flat" : t.pnlSol >= 0 ? "win" : "loss";
-    return `<li class="row ${cls} muted"><div class="body">
-      <div class="head"><span class="sym">${esc(short(t.mint))}</span><span class="x">${t.unpriced ? "unpriced" : `${t.mult}x`}</span></div>
-      <div class="meta">${fmtAgo(t.closedAt)} · ${esc(t.reason)}</div>
     </div></li>`;
   }).join("");
 
@@ -1028,7 +1043,6 @@ function renderPage() {
   .row.win{border-left-color:var(--cyan)}
   .row.loss{border-left-color:var(--clay)}
   .row.flat{border-left-color:var(--edge)}
-  .row.muted{opacity:.5}
   .head{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:3px}
   .sym{font-weight:600}
   .x{font-family:'Space Grotesk',sans-serif;font-weight:700;font-size:14px}
@@ -1044,29 +1058,30 @@ function renderPage() {
 </style></head><body>
   <h1>Follow <em>trader</em></h1>
   <div class="sub">
-    v5.0 · following ${CONFIG.FOLLOW_WALLETS.map((w) => esc(short(w))).join(" + ")} ·
-    follow live ${CONFIG.FOLLOW_LIVE ? "ON" : "OFF (paper)"} ·
+    v5.1 · following ${CONFIG.FOLLOW_WALLETS.map((w) => esc(short(w)) + (isPaperOnly(w) ? "(p)" : "")).join(" + ")} ·
+    follow live ${CONFIG.FOLLOW_LIVE ? "ON" : "OFF"} · (p) = paper only ·
     exits: their sell · trail ${CONFIG.TRAIL_ARM}x/−${CONFIG.TRAIL_RETRACE * 100}% · corpse ≤${CONFIG.FOLLOW_CORPSE_MULT}x@${CONFIG.FOLLOW_CORPSE_MIN}m · ${Math.round(CONFIG.FOLLOW_MAX_HOLD_MIN / 60)}h max ·
     ${persistOk ? "history saved ✓" : "HISTORY NOT SAVED"} · <a href="/book.csv" style="color:var(--cyan)">book.csv</a> ·
-    ${CONFIG.WATCH_WALLETS.length ? `confluence: ${CONFIG.WATCH_WALLETS.length} wallets` : "confluence: parked"} ·
     night ${CONFIG.NIGHT_START}:00-${CONFIG.NIGHT_END}:00 ·
     ${webhookHits} hits · ${CONFIG.TG_TOKEN ? "telegram ✓" : "TELEGRAM NOT SET"}
   </div>
   ${persistBanner}
   ${liveBanner}
-  <h2>Follow book — ${CONFIG.FOLLOW_LIVE ? "LIVE" : "paper"} (${CONFIG.FOLLOW_PAPER_SOL} SOL paper stakes)</h2>
+  <h2>Follow book — paper (${CONFIG.FOLLOW_PAPER_SOL} SOL stakes)</h2>
   <div class="cards">
-    <div class="card"><b style="color:${fsx.totalPnlSol >= 0 ? "var(--cyan)" : "var(--clay)"}">${fsx.totalPnlSol >= 0 ? "+" : ""}${fsx.totalPnlSol}</b><span>paper P&amp;L SOL</span></div>
-    <div class="card"><b>${fsx.winRate}%</b><span>win rate</span></div>
-    <div class="card"><b>${fsx.closed}</b><span>closed</span></div>
-    <div class="card"><b>${fsx.open}</b><span>open</span></div>
+    <div class="card"><b style="color:${allFollow.totalPnlSol >= 0 ? "var(--cyan)" : "var(--clay)"}">${allFollow.totalPnlSol >= 0 ? "+" : ""}${allFollow.totalPnlSol}</b><span>all wallets</span></div>
+    <div class="card"><b style="color:${liveFollow.totalPnlSol >= 0 ? "var(--cyan)" : "var(--clay)"}">${liveFollow.totalPnlSol >= 0 ? "+" : ""}${liveFollow.totalPnlSol}</b><span>live-eligible</span></div>
+    <div class="card"><b style="color:${paperFollow.totalPnlSol >= 0 ? "var(--cyan)" : "var(--clay)"}">${paperFollow.totalPnlSol >= 0 ? "+" : ""}${paperFollow.totalPnlSol}</b><span>paper-only</span></div>
+    <div class="card"><b>${allFollow.winRate}%</b><span>win rate</span></div>
+    <div class="card"><b>${allFollow.closed}</b><span>closed</span></div>
   </div>
-  ${followOpenRows ? `<ul>${followOpenRows}</ul>` : `<div class="none">No open follows — waiting for ${CONFIG.FOLLOW_WALLETS.map((w) => esc(short(w))).join("/")} to buy something.</div>`}
+  ${walletRows ? `<ul>${walletRows}</ul>` : ""}
+  ${followOpenRows ? `<ul>${followOpenRows}</ul>` : `<div class="none">No open follows — waiting for a buy.</div>`}
   ${followTradeRows ? `<ul>${followTradeRows}</ul>` : `<div class="none">No closed follows yet.</div>`}
   ${liveReady() ? `
   <h2>Live book (real money)</h2>
   <div class="cards">
-    <div class="card"><b style="color:${ls.netSol >= 0 ? "var(--cyan)" : "var(--clay)"}">${ls.netSol >= 0 ? "+" : ""}${ls.netSol}</b><span>net SOL (est fees −${ls.feesEst})</span></div>
+    <div class="card"><b style="color:${ls.netSol >= 0 ? "var(--cyan)" : "var(--clay)"}">${ls.netSol >= 0 ? "+" : ""}${ls.netSol}</b><span>net SOL (fees −${ls.feesEst})</span></div>
     <div class="card"><b style="color:${ls.netGbp >= 0 ? "var(--cyan)" : "var(--clay)"}">£${ls.netGbp}</b><span>net GBP</span></div>
     <div class="card"><b>${ls.winRate}%</b><span>win rate</span></div>
     <div class="card"><b>${ls.closed}</b><span>closed</span></div>
@@ -1074,15 +1089,6 @@ function renderPage() {
   </div>
   ${liveOpenRows ? `<ul>${liveOpenRows}</ul>` : ""}
   ${liveTradeRows ? `<ul>${liveTradeRows}</ul>` : `<div class="none">No live trades yet.</div>`}
-  ` : ""}
-  ${CONFIG.WATCH_WALLETS.length ? `
-  <h2 class="dim">Confluence signals (not money)</h2>
-  <div class="cards">
-    <div class="card"><b>${s.winRate}%</b><span>win rate</span></div>
-    <div class="card"><b>${s.closed}</b><span>closed</span></div>
-    <div class="card"><b>${s.open + s.settling}</b><span>open</span></div>
-  </div>
-  ${sigRows ? `<ul>${sigRows}</ul>` : `<div class="none">No signals.</div>`}
   ` : ""}
 </body></html>`;
 }
@@ -1103,10 +1109,10 @@ function bookCsv() {
   const sigAll = persistOk ? loadClosed(SIG_FILE, 100000) : closedTrades;
   const livAll = persistOk ? loadClosed(LIVE_FILE, 100000) : liveClosed;
   const folAll = persistOk ? loadClosed(FOLLOW_FILE, 100000) : followClosed;
-  const rows = [["book","mint","closedAt","reason","heldMin","mult","peakMult","pnlSol","wallet","theirSize","fhpcSize","solIn","solOut","tag"]];
-  for (const t of folAll) rows.push(["follow", t.mint, t.closedAt, t.reason, t.heldMin, t.mult, t.peakMult, t.pnlSol, t.wallet, t.theirSize, "", "", "", ""]);
+  const rows = [["book","mint","closedAt","reason","heldMin","mult","peakMult","pnlSol","wallet","paperOnly","theirSize","solIn","solOut","tag"]];
+  for (const t of folAll) rows.push(["follow", t.mint, t.closedAt, t.reason, t.heldMin, t.mult, t.peakMult, t.pnlSol, t.wallet, t.paperOnly ? "yes" : "no", t.theirSize, "", "", ""]);
   for (const t of livAll) rows.push(["live", t.mint, t.closedAt, t.reason, "", t.mult, t.peakMult, t.pnlSol, "", "", "", t.solIn, t.solOut, t.tag || ""]);
-  for (const t of sigAll) rows.push(["signal", t.mint, t.closedAt, t.reason, t.heldMin, t.mult, t.peakMult, t.pnlSol, "", "", t.fhpcSize, "", "", t.liveNote || ""]);
+  for (const t of sigAll) rows.push(["signal", t.mint, t.closedAt, t.reason, t.heldMin, t.mult, t.peakMult, t.pnlSol, "", "", "", "", "", t.liveNote || ""]);
   return rows.map((r) => r.map(csvEscape).join(",")).join("\n");
 }
 
@@ -1134,8 +1140,8 @@ const server = http.createServer((req, res) => {
     if (!liveReady()) { res.writeHead(400); return res.end("live engine not configured"); }
     rolloverLiveDay();
     liveArmed = true; disarmReason = "";
-    sendTelegram(`🔴 <b>LIVE ARMED</b> — follow live ${CONFIG.FOLLOW_LIVE ? `ON (${CONFIG.FOLLOW_POSITION_SOL}/trade)` : "OFF (paper only)"}, cap −${CONFIG.LIVE_MAX_DAILY_LOSS}, floor ${CONFIG.LIVE_MIN_WALLET}.`);
-    res.writeHead(200); return res.end(`LIVE ARMED. Follow live: ${CONFIG.FOLLOW_LIVE ? "ON" : "OFF (set FOLLOW_LIVE=true to enable)"}.`);
+    sendTelegram(`🔴 <b>LIVE ARMED</b> — follow live ${CONFIG.FOLLOW_LIVE ? `ON (${CONFIG.FOLLOW_POSITION_SOL}/trade)` : "OFF"}${CONFIG.PAPER_ONLY_WALLETS.length ? `, ${CONFIG.PAPER_ONLY_WALLETS.length} paper-only wallet(s)` : ""}, cap −${CONFIG.LIVE_MAX_DAILY_LOSS}, floor ${CONFIG.LIVE_MIN_WALLET}.`);
+    res.writeHead(200); return res.end(`LIVE ARMED. Follow live: ${CONFIG.FOLLOW_LIVE ? "ON" : "OFF"}. Paper-only wallets: ${CONFIG.PAPER_ONLY_WALLETS.length}.`);
   }
   if (path_ === "/stop") {
     if (CONFIG.CONTROL_KEY && !keyOk) { res.writeHead(403); return res.end("bad key"); }
@@ -1169,8 +1175,8 @@ const server = http.createServer((req, res) => {
   if (path_ === "/book.json") {
     res.writeHead(200, { "Content-Type": "application/json" });
     return res.end(JSON.stringify({
-      follow: { stats: followStats(), open: [...followOpen.values()], closed: followClosed },
-      live: { armed: liveArmed, followLive: CONFIG.FOLLOW_LIVE, stats: liveStats(), open: [...liveOpen.values()], closed: liveClosed },
+      follow: { perWallet: perWalletStats(), open: [...followOpen.values()], closed: followClosed },
+      live: { armed: liveArmed, followLive: CONFIG.FOLLOW_LIVE, paperOnly: CONFIG.PAPER_ONLY_WALLETS, stats: liveStats(), open: [...liveOpen.values()], closed: liveClosed },
       signal: { stats: stats(), open: [...openPositions.values()], closed: closedTrades },
     }, null, 2));
   }
@@ -1180,6 +1186,6 @@ const server = http.createServer((req, res) => {
 });
 
 server.listen(CONFIG.PORT, () => {
-  console.log(`Follow trader v5.0 on ${CONFIG.PORT} — following ${CONFIG.FOLLOW_WALLETS.length} wallet(s), follow live ${CONFIG.FOLLOW_LIVE ? "ON" : "OFF"}, persistence ${persistOk ? "ON" : "OFF"}`);
+  console.log(`Follow trader v5.1 on ${CONFIG.PORT} — ${CONFIG.FOLLOW_WALLETS.length} followed (${CONFIG.PAPER_ONLY_WALLETS.length} paper-only), follow live ${CONFIG.FOLLOW_LIVE ? "ON" : "OFF"}`);
   if (liveWalletError) console.warn(liveWalletError);
 });
