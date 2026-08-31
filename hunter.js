@@ -69,6 +69,22 @@ const CFG = {
   WALLET_TAGS: process.env.WALLET_TAGS || "smart_trader",
   /* optional manual token list; when set, trending is not called */
   TOKENS: (process.env.TOKENS || "").split(",").map((s) => s.trim()).filter(Boolean),
+
+  /* ── CO-OCCURRENCE (v12) ──
+     Every ranking-based source selects for capital, so it only ever returns
+     whales. This asks a different question entirely: which wallets keep
+     turning up in the SAME coins as a wallet we already trust? Repeat
+     co-occurrence is independent of size — a small trader who appears
+     alongside a good wallet across several coins is exactly the target.
+     Only RECENT pages of each coin are read, so it works on busy coins
+     where full-history harvesting was impossible, and "traded near when my
+     good wallet did" is a stronger signal than "traded this coin ever". */
+  SEED_COIN_PAGES: Number(process.env.SEED_COIN_PAGES || 6),   // recent pages per seed wallet
+  SEED_COINS: Number(process.env.SEED_COINS || 6),             // coins per seed wallet
+  COOC_PAGES: Number(process.env.COOC_PAGES || 4),             // recent pages per coin
+  COOC_WINDOW_H: Number(process.env.COOC_WINDOW_H || 48),      // +/- hours around seed's buy
+  COOC_MIN_HITS: Number(process.env.COOC_MIN_HITS || 2),       // coins in common to qualify
+  COOC_EVERY: Number(process.env.COOC_EVERY || 2),             // run every N cycles
   BOARD_MIN_TRADES: Number(process.env.BOARD_MIN_TRADES || 20),
   BOARD_MIRROR_RATIO: Number(process.env.BOARD_MIRROR_RATIO || 50),
 
@@ -116,6 +132,15 @@ const SOL_MINT = "So11111111111111111111111111111111111111112";
 const QUOTES = new Set([SOL_MINT,
   "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
   "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"]);
+const PROGRAMS = new Set([
+  "11111111111111111111111111111111",
+  "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+  "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL",
+  "ComputeBudget111111111111111111111111111111",
+  "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr",
+  "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",
+  "jitodontfront111111111111111111111nopainnogain",
+]);
 const MINT_TYPES = new Set(["TOKEN_MINT", "CREATE_POOL", "INITIALIZE_MINT"]);
 const LAMPORTS = 1e9;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -263,6 +288,127 @@ async function pullCandidates() {
     await sleep(1200);
   }
   DB.funnel.boardPulled += out.length;
+  return out;
+}
+
+/* ── CO-OCCURRENCE DISCOVERY ────────────────────────────
+   1. For each trusted wallet, find the coins it recently bought.
+   2. For each of those coins, read only the RECENT pages.
+   3. Count which other wallets bought the same coin near the same time.
+   4. Wallets appearing across >= COOC_MIN_HITS coins go into the queue,
+      ranked by how many they share. Size never enters into it. */
+
+function trustedWallets() {
+  const verified = Object.entries(DB.verdicts)
+    .filter(([, v]) => v.result === "pass").map(([w]) => w);
+  const scored = Object.values(DB.wallets)
+    .filter((w) => !w.excluded && !w.dormant && (w.score || 0) >= CFG.MIN_SCORE)
+    .sort((a, b) => (b.score || 0) - (a.score || 0))
+    .map((w) => w.wallet);
+  return [...new Set([...CFG.SEED_WALLETS, ...verified, ...scored])].slice(0, 4);
+}
+
+/* coins a trusted wallet bought recently, with the timestamp it bought at */
+async function seedCoins(seed) {
+  const coins = new Map();
+  let before = "";
+  for (let page = 0; page < CFG.SEED_COIN_PAGES; page++) {
+    status = `coins of ${seed.slice(0, 6)}… p${page + 1}`;
+    let batch;
+    try { batch = await heliusPage(seed, before); } catch { break; }
+    if (batch === null) { page--; continue; }
+    if (!batch.length) break;
+    for (const tx of batch) {
+      const { paid } = solLeg(tx, seed);
+      if (paid < CFG.MIN_BUY_SOL) continue;
+      const d = mintDeltas(tx, seed);
+      for (const [mint, qty] of Object.entries(d)) {
+        if (qty <= 0) continue;
+        if (!coins.has(mint)) coins.set(mint, { mint, at: tx.timestamp, seed });
+      }
+    }
+    before = batch[batch.length - 1].signature;
+    if (batch.length < 100) break;
+    await sleep(300);
+  }
+  return [...coins.values()].slice(0, CFG.SEED_COINS);
+}
+
+/* wallets that bought the same coin within COOC_WINDOW_H of the seed */
+async function coinNeighbours(coin) {
+  const found = new Set();
+  const lo = coin.at - CFG.COOC_WINDOW_H * 3600;
+  const hi = coin.at + CFG.COOC_WINDOW_H * 3600;
+  let before = "";
+  for (let page = 0; page < CFG.COOC_PAGES; page++) {
+    status = `neighbours of ${coin.mint.slice(0, 6)}… p${page + 1}`;
+    let batch;
+    try { batch = await heliusPage(coin.mint, before); } catch { break; }
+    if (batch === null) { page--; continue; }
+    if (!batch.length) break;
+    let anyInWindow = false;
+    for (const tx of batch) {
+      if (tx.timestamp < lo || tx.timestamp > hi) continue;
+      anyInWindow = true;
+      const buyers = new Set();
+      for (const tr of tx.tokenTransfers || []) {
+        if (tr.mint !== coin.mint) continue;
+        if (tr.toUserAccount) buyers.add(tr.toUserAccount);
+      }
+      for (const w of buyers) {
+        if (w === coin.seed) continue;
+        if (QUOTES.has(w) || PROGRAMS.has(w)) continue;
+        const { paid } = solLeg(tx, w);
+        if (paid < CFG.MIN_BUY_SOL) continue;
+        const d = mintDeltas(tx, w)[coin.mint];
+        if (!d || d <= 0) continue;
+        found.add(w);
+      }
+    }
+    const oldest = batch[batch.length - 1].timestamp;
+    before = batch[batch.length - 1].signature;
+    if (oldest < lo && !anyInWindow) break;   // paged past the window
+    if (batch.length < 100) break;
+    await sleep(300);
+  }
+  return found;
+}
+
+async function pullCoOccurrence() {
+  const seeds = trustedWallets();
+  if (!seeds.length) { logLine(`  no trusted wallets to mine from`); return []; }
+
+  const hits = new Map();          // wallet -> Set of coins shared
+  const coinCount = { total: 0 };
+  for (const seed of seeds) {
+    const coins = await seedCoins(seed);
+    logLine(`  ${seed.slice(0, 6)}…: ${coins.length} recent coins`);
+    for (const coin of coins) {
+      const nb = await coinNeighbours(coin);
+      coinCount.total++;
+      for (const w of nb) {
+        if (!hits.has(w)) hits.set(w, new Set());
+        hits.get(w).add(coin.mint);
+      }
+      await sleep(200);
+    }
+  }
+
+  const out = [];
+  for (const [wallet, coinsShared] of hits) {
+    if (coinsShared.size < CFG.COOC_MIN_HITS) continue;
+    out.push({
+      wallet,
+      boardPnl: 0,
+      boardVolume: 0,
+      boardTrades: 0,
+      cooc: coinsShared.size,
+      window: `co-occurrence ×${coinsShared.size}`,
+    });
+  }
+  out.sort((a, b) => b.cooc - a.cooc);
+  DB.funnel.boardPulled += out.length;
+  logLine(`  co-occurrence: ${coinCount.total} coins → ${hits.size} neighbours → ${out.length} seen in ${CFG.COOC_MIN_HITS}+ coins`);
   return out;
 }
 
@@ -626,7 +772,11 @@ async function cycle() {
 
     /* top the queue up from the leaderboard when it runs low */
     if (DB.queue.length < CFG.MAX_VET_PER_CYCLE) {
-      const board = await pullCandidates();
+      /* co-occurrence is the only size-blind source, so favour it; fall back
+         to Birdeye smart traders when there is nothing trusted to mine yet */
+      const useCooc = trustedWallets().length > 0 && cycleNo % CFG.COOC_EVERY === 0;
+      let board = useCooc ? await pullCoOccurrence() : await pullCandidates();
+      if (!board.length) board = useCooc ? await pullCandidates() : await pullCoOccurrence();
       let added = 0, known = 0;
       for (const t of board) {
         if (DB.verdicts[t.wallet]) { known++; continue; }
@@ -722,7 +872,7 @@ function renderPage() {
         <span class="score">${w.score}</span></div>
       <div class="meta"><b>${s.roiPct}% ROI</b> on ${s.matchedCostSol} SOL · ${s.winRatePct}% win · hold ${s.medianHoldMin}m · ${s.closed} round trips</div>
       <div class="meta">pool $${s.medianPoolUsd.toLocaleString()} · ${s.sizeRatio}x my stake · ${s.visiblePct}% visible · ${s.txCount}${s.txCeiling ? "+" : ""} txs · ${s.totalDays}d observed</div>
-      <div class="meta">Birdeye smart_trader via ${esc(w.board?.window || "?")}: $${(w.board?.boardPnl ?? 0).toLocaleString()} realised · vetted ${ago(w.vettedAt)} · last traded ${ago(w.lastActiveTs)}</div>
+      <div class="meta">${w.board?.cooc ? `swims with your good wallets in ${w.board.cooc} coins` : `Birdeye smart_trader · $${(w.board?.boardPnl ?? 0).toLocaleString()} realised`} · vetted ${ago(w.vettedAt)} · last traded ${ago(w.lastActiveTs)}</div>
       <div class="meta mono">${esc(w.wallet)}</div>
       <div class="acts">
         <a class="gmgn" href="https://gmgn.ai/sol/address/${esc(w.wallet)}" target="_blank" rel="noopener">Check on GMGN ↗</a>
@@ -785,9 +935,9 @@ function renderPage() {
   .warn{background:#241A14;border:1px solid var(--amber);padding:10px 12px;margin-bottom:14px;color:var(--amber);font-size:11px}
 </style></head><body>
   <h1>Wallet <em>hunter</em></h1>
-  <div class="sub">v11 · Birdeye smart_trader discovery → Helius vetting · cycle ${CFG.CYCLE_MINUTES}m · top ${CFG.SHORTLIST_SIZE} · ${persistOk ? "database saved ✓" : "IN MEMORY ONLY"} · <a href="/db.json" style="color:var(--green)">db.json</a> · <a href="/probe" style="color:var(--green)">probe</a></div>
+  <div class="sub">v12 · co-occurrence + smart_trader discovery → Helius vetting · cycle ${CFG.CYCLE_MINUTES}m · top ${CFG.SHORTLIST_SIZE} · ${persistOk ? "database saved ✓" : "IN MEMORY ONLY"} · <a href="/db.json" style="color:var(--green)">db.json</a> · <a href="/probe" style="color:var(--green)">probe</a></div>
   <div class="warn">A shortlist, not a verdict. Birdeye tags these as non-bot smart traders; the vetting below only sees one address over ${CFG.VET_DAYS} days. Check each on GMGN, then record pass/fail so the scoring learns which signals actually matter.</div>
-  <div class="status">▶ ${esc(status)}<br>cycles: ${DB.cycles} (${ago(DB.lastCycleAt)}) · source: Birdeye smart_trader tag · ${CFG.TOKENS_PER_CYCLE} tokens/cycle · queue ${DB.queue.length}</div>
+  <div class="status">▶ ${esc(status)}<br>cycles: ${DB.cycles} (${ago(DB.lastCycleAt)}) · sources: co-occurrence + Birdeye smart_trader · trusted seeds: ${trustedWallets().length} · queue ${DB.queue.length}</div>
   <div class="cards">
     <div class="card"><b style="color:var(--green)">${list.length}</b><span>shortlist</span></div>
     <div class="card"><b>${all.length}</b><span>vetted</span></div>
@@ -795,7 +945,7 @@ function renderPage() {
     <div class="card"><b>${passed}/${judged}</b><span>your passes</span></div>
   </div>
   <div class="box"><b>Funnel</b>
-    <div class="tline"><span>smart traders pulled</span><span>${f.boardPulled}</span></div>
+    <div class="tline"><span>candidates pulled</span><span>${f.boardPulled}</span></div>
     <div class="tline"><span>already known / judged</span><span>${f.alreadyKnown}</span></div>
     <div class="tline"><span>pre-screened → rejected</span><span>${f.preScreened} → ${f.preRejected}</span></div>
     <div class="tline"><span>fully vetted → excluded</span><span>${f.vetted} → ${f.excluded}</span></div>
@@ -864,7 +1014,7 @@ http.createServer(async (req, res) => {
   res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
   res.end(renderPage());
 }).listen(CFG.PORT, () => {
-  console.log(`Wallet hunter v11 on ${CFG.PORT} — persistence ${persistOk ? "ON" : "OFF"}`);
+  console.log(`Wallet hunter v12 on ${CFG.PORT} — persistence ${persistOk ? "ON" : "OFF"}`);
   if (!CFG.KEY) { status = "FAILED: HELIUS_API_KEY not set"; return; }
   if (!CFG.BIRDEYE_KEY) { status = "FAILED: BIRDEYE_API_KEY not set"; return; }
   cycle();
