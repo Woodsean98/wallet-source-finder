@@ -55,16 +55,20 @@ const CFG = {
   SEED_WALLETS: (process.env.SEED_WALLETS || "")
     .split(",").map((s) => s.trim()).filter(Boolean),
 
-  /* ── Birdeye leaderboard discovery ── */
-  BOARD_LIMIT: Number(process.env.BOARD_LIMIT || 100),      // max 100
-  BOARD_MAX_OFFSET: Number(process.env.BOARD_MAX_OFFSET || 2000),
-  BOARD_WINDOWS: (process.env.BOARD_WINDOWS || "30d,1W,90d")
-    .split(",").map((s) => s.trim()).filter(Boolean),
-  /* sort on NET PnL. Sorting on realized_pnl surfaces an accounting artefact:
-     wallets holding a dust token with a garbage price book a vast "realised"
-     gain and an equal, opposite unrealised loss that cancel to nothing. The
-     top of that list was wallets with 3 trades and $15m of fictional PnL. */
-  BOARD_SORT: process.env.BOARD_SORT || "PnL",
+  /* ── Birdeye discovery ──
+     The net-PnL leaderboard ranks by ABSOLUTE profit, so its top is MEV bots
+     and market makers — measured at 909,474 txs/day and 337,273x the stake.
+     Ranking by size can never surface someone trading GBP100 positions well.
+     So v11 asks Birdeye for SMART TRADERS per token instead: their own tag,
+     defined as a non-bot wallet in the top realised PnL over 90 days with
+     over $10,000 realised, with bots excluded before ranking. */
+  TOKENS_PER_CYCLE: Number(process.env.TOKENS_PER_CYCLE || 8),
+  TRADERS_PER_TOKEN: Number(process.env.TRADERS_PER_TOKEN || 10),  // max 10
+  TRADER_WINDOW: process.env.TRADER_WINDOW || "30d",
+  TRADER_SORT: process.env.TRADER_SORT || "realized_pnl",
+  WALLET_TAGS: process.env.WALLET_TAGS || "smart_trader",
+  /* optional manual token list; when set, trending is not called */
+  TOKENS: (process.env.TOKENS || "").split(",").map((s) => s.trim()).filter(Boolean),
   BOARD_MIN_TRADES: Number(process.env.BOARD_MIN_TRADES || 20),
   BOARD_MIRROR_RATIO: Number(process.env.BOARD_MIRROR_RATIO || 50),
 
@@ -130,7 +134,7 @@ try {
 
 const DB = {
   wallets: {}, verdicts: {}, queue: [], cycles: 0,
-  boardOffset: 0, boardWindowIdx: 0,
+  tokenOffset: 0,
   startedAt: now(), lastCycleAt: null, log: [],
   funnel: { boardPulled: 0, alreadyKnown: 0, preScreened: 0, preRejected: 0,
             vetted: 0, excluded: 0 },
@@ -141,7 +145,7 @@ function loadDb() {
   try {
     if (!fs.existsSync(DB_FILE)) return;
     Object.assign(DB, JSON.parse(fs.readFileSync(DB_FILE, "utf8")));
-    DB.verdicts ||= {}; DB.queue ||= [];
+    DB.verdicts ||= {}; DB.queue ||= []; DB.tokenOffset ||= 0;
     DB.funnel ||= { boardPulled: 0, alreadyKnown: 0, preScreened: 0,
                     preRejected: 0, vetted: 0, excluded: 0 };
   } catch (e) { console.warn("db load failed:", e.message); }
@@ -180,71 +184,85 @@ async function birdeye(pathAndQuery) {
   catch { throw new Error(`birdeye returned non-JSON: ${text.slice(0, 180)}`); }
 }
 
-/* Pull one page of profitable traders. Rotates window and advances offset
-   each cycle so we work steadily deeper through the leaderboard. */
-async function pullLeaderboard() {
-  const window = CFG.BOARD_WINDOWS[DB.boardWindowIdx % CFG.BOARD_WINDOWS.length];
-  const offset = DB.boardOffset;
-  status = `leaderboard ${window} @${offset}`;
+/* Tokens to ask about. Birdeye's own trending list, or a manual TOKENS list. */
+async function pullTokens() {
+  if (CFG.TOKENS.length) return CFG.TOKENS.slice(0, CFG.TOKENS_PER_CYCLE);
+  status = "fetching trending tokens";
+  let j;
+  try { j = await birdeye(`/defi/token_trending?sort_by=volume24hUSD&sort_type=desc&offset=${DB.tokenOffset}&limit=20`); }
+  catch (e) { logLine(`  trending tokens failed: ${e.message}`); return []; }
 
-  const q = `/trader/gainers-losers?type=${encodeURIComponent(window)}`
-    + `&sort_by=${encodeURIComponent(CFG.BOARD_SORT)}&sort_type=desc`
-    + `&offset=${offset}&limit=${CFG.BOARD_LIMIT}`;
+  const rows = Array.isArray(j?.data?.tokens) ? j.data.tokens
+    : Array.isArray(j?.data?.items) ? j.data.items
+    : Array.isArray(j?.data) ? j.data : [];
+  const out = [];
+  for (const r of rows) {
+    const a = r?.address || r?.tokenAddress || r?.mint;
+    if (typeof a === "string" && a.length >= 32 && a.length <= 46 && !QUOTES.has(a)) {
+      out.push({ address: a, symbol: r?.symbol || a.slice(0, 6) });
+    }
+  }
+  DB.tokenOffset = (DB.tokenOffset + 20) % 100;
+  if (!out.length) logLine(`  trending returned ${rows.length} rows, 0 usable — check /probe?q=/defi/token_trending`);
+  return out.slice(0, CFG.TOKENS_PER_CYCLE);
+}
 
+/* Ask Birdeye for the SMART TRADERS of one token. Bots are excluded by the
+   tag itself, so we never spend Helius calls discovering they were bots. */
+async function pullSmartTraders(token) {
+  const q = `/defi/v2/tokens/top_traders?address=${encodeURIComponent(token.address)}`
+    + `&time_frame=${encodeURIComponent(CFG.TRADER_WINDOW)}`
+    + `&sort_by=${encodeURIComponent(CFG.TRADER_SORT)}&sort_type=desc`
+    + `&offset=0&limit=${CFG.TRADERS_PER_TOKEN}`
+    + `&wallet_tags=${encodeURIComponent(CFG.WALLET_TAGS)}`;
   let j;
   try { j = await birdeye(q); }
-  catch (e) { logLine(`  leaderboard failed: ${e.message}`); return []; }
+  catch (e) { logLine(`  ${token.symbol}: top_traders failed — ${e.message}`); return []; }
 
-  /* Be liberal about the response shape — take whichever array we find and
-     pull the address field under whatever name it uses. */
   const rows = Array.isArray(j?.data?.items) ? j.data.items
     : Array.isArray(j?.data) ? j.data
     : Array.isArray(j?.items) ? j.items : [];
 
   const out = [];
-  const dropped = {};
-  const drop = (why) => { dropped[why] = (dropped[why] || 0) + 1; };
-
   for (const r of rows) {
-    const addr = r?.address || r?.wallet || r?.owner || r?.trader || r?.account;
-    if (typeof addr !== "string" || addr.length < 32 || addr.length > 46) { drop("no address"); continue; }
-
-    const pnl = Number(r?.pnl ?? 0);
-    const realised = Number(r?.realized_pnl ?? r?.realizedPnl ?? 0);
-    const unrealised = Number(r?.unrealized_pnl ?? r?.unrealizedPnl ?? 0);
-    const trades = Number(r?.trade_count ?? r?.tradeCount ?? r?.trade ?? 0);
-
-    /* the mirror artefact: realised and unrealised are equal and opposite,
-       so the pair is fictional and the only real number is the tiny net */
-    if (Math.abs(pnl) > 0 && Math.abs(realised) > CFG.BOARD_MIRROR_RATIO * Math.abs(pnl)) {
-      drop("mirrored pnl (dust pricing)"); continue;
-    }
-    if (pnl <= 0) { drop("net pnl not positive"); continue; }
-    if (trades < CFG.BOARD_MIN_TRADES) { drop(`under ${CFG.BOARD_MIN_TRADES} trades`); continue; }
-
+    const addr = r?.owner || r?.address || r?.wallet || r?.trader || r?.account;
+    if (typeof addr !== "string" || addr.length < 32 || addr.length > 46) continue;
+    const trades = Number(r?.trade ?? r?.tradeBuy ?? 0) + Number(r?.tradeSell ?? 0);
     out.push({
       wallet: addr,
-      boardPnl: +pnl.toFixed(2),
-      boardRealised: +realised.toFixed(2),
-      boardVolume: Number(r?.volume ?? r?.volume_usd ?? r?.volumeUsd ?? 0),
+      boardPnl: +Number(r?.realizedPnl ?? r?.realized_pnl ?? r?.pnl ?? 0).toFixed(2),
+      boardVolume: Number(r?.volumeUsd ?? r?.volume_usd ?? r?.volume ?? 0),
       boardTrades: trades,
-      window,
+      window: `${CFG.TRADER_WINDOW} ${token.symbol}`,
+      tags: r?.tags || r?.wallet_tags || null,
     });
   }
-
-  const dropSummary = Object.entries(dropped).sort((a, b) => b[1] - a[1])
-    .map(([w, n]) => `${n}× ${w}`).join(", ");
-
-  /* advance the cursor for next cycle */
-  DB.boardOffset += CFG.BOARD_LIMIT;
-  if (DB.boardOffset >= CFG.BOARD_MAX_OFFSET) {
-    DB.boardOffset = 0;
-    DB.boardWindowIdx++;
+  if (rows.length && !out.length) {
+    logLine(`  ${token.symbol}: ${rows.length} rows, no address field matched — check /probe`);
   }
+  return out;
+}
 
+/* One discovery pass: tokens -> smart traders -> dedupe -> queue */
+async function pullCandidates() {
+  const tokens = await pullTokens();
+  if (!tokens.length) return [];
+  const seen = new Set();
+  const out = [];
+  for (const t of tokens) {
+    status = `smart traders of ${t.symbol}`;
+    const traders = await pullSmartTraders(t);
+    let fresh = 0;
+    for (const w of traders) {
+      if (seen.has(w.wallet)) continue;
+      seen.add(w.wallet);
+      out.push(w);
+      fresh++;
+    }
+    logLine(`  ${t.symbol}: ${traders.length} smart traders (${fresh} new)`);
+    await sleep(1200);
+  }
   DB.funnel.boardPulled += out.length;
-  logLine(`  leaderboard ${window} @${offset}: ${rows.length} rows → ${out.length} usable`
-    + (dropSummary ? ` · dropped: ${dropSummary}` : ""));
   return out;
 }
 
@@ -608,7 +626,7 @@ async function cycle() {
 
     /* top the queue up from the leaderboard when it runs low */
     if (DB.queue.length < CFG.MAX_VET_PER_CYCLE) {
-      const board = await pullLeaderboard();
+      const board = await pullCandidates();
       let added = 0, known = 0;
       for (const t of board) {
         if (DB.verdicts[t.wallet]) { known++; continue; }
@@ -704,7 +722,7 @@ function renderPage() {
         <span class="score">${w.score}</span></div>
       <div class="meta"><b>${s.roiPct}% ROI</b> on ${s.matchedCostSol} SOL · ${s.winRatePct}% win · hold ${s.medianHoldMin}m · ${s.closed} round trips</div>
       <div class="meta">pool $${s.medianPoolUsd.toLocaleString()} · ${s.sizeRatio}x my stake · ${s.visiblePct}% visible · ${s.txCount}${s.txCeiling ? "+" : ""} txs · ${s.totalDays}d observed</div>
-      <div class="meta">Birdeye ${esc(w.board?.window || "?")}: $${(w.board?.boardPnl ?? 0).toLocaleString()} net over ${w.board?.boardTrades ?? "?"} trades · vetted ${ago(w.vettedAt)} · last traded ${ago(w.lastActiveTs)}</div>
+      <div class="meta">Birdeye smart_trader via ${esc(w.board?.window || "?")}: $${(w.board?.boardPnl ?? 0).toLocaleString()} realised · vetted ${ago(w.vettedAt)} · last traded ${ago(w.lastActiveTs)}</div>
       <div class="meta mono">${esc(w.wallet)}</div>
       <div class="acts">
         <a class="gmgn" href="https://gmgn.ai/sol/address/${esc(w.wallet)}" target="_blank" rel="noopener">Check on GMGN ↗</a>
@@ -767,9 +785,9 @@ function renderPage() {
   .warn{background:#241A14;border:1px solid var(--amber);padding:10px 12px;margin-bottom:14px;color:var(--amber);font-size:11px}
 </style></head><body>
   <h1>Wallet <em>hunter</em></h1>
-  <div class="sub">v10.1 · wallet-first · Birdeye net-PnL leaderboard → Helius vetting · cycle ${CFG.CYCLE_MINUTES}m · top ${CFG.SHORTLIST_SIZE} · ${persistOk ? "database saved ✓" : "IN MEMORY ONLY"} · <a href="/db.json" style="color:var(--green)">db.json</a> · <a href="/probe" style="color:var(--green)">probe</a></div>
-  <div class="warn">A shortlist, not a verdict. Birdeye ranks these by realised PnL; the vetting below only sees one address over ${CFG.VET_DAYS} days. Check each on GMGN, then record pass/fail so the scoring learns which signals actually matter.</div>
-  <div class="status">▶ ${esc(status)}<br>cycles: ${DB.cycles} (${ago(DB.lastCycleAt)}) · leaderboard at ${CFG.BOARD_WINDOWS[DB.boardWindowIdx % CFG.BOARD_WINDOWS.length]} offset ${DB.boardOffset} · queue ${DB.queue.length}</div>
+  <div class="sub">v11 · Birdeye smart_trader discovery → Helius vetting · cycle ${CFG.CYCLE_MINUTES}m · top ${CFG.SHORTLIST_SIZE} · ${persistOk ? "database saved ✓" : "IN MEMORY ONLY"} · <a href="/db.json" style="color:var(--green)">db.json</a> · <a href="/probe" style="color:var(--green)">probe</a></div>
+  <div class="warn">A shortlist, not a verdict. Birdeye tags these as non-bot smart traders; the vetting below only sees one address over ${CFG.VET_DAYS} days. Check each on GMGN, then record pass/fail so the scoring learns which signals actually matter.</div>
+  <div class="status">▶ ${esc(status)}<br>cycles: ${DB.cycles} (${ago(DB.lastCycleAt)}) · source: Birdeye smart_trader tag · ${CFG.TOKENS_PER_CYCLE} tokens/cycle · queue ${DB.queue.length}</div>
   <div class="cards">
     <div class="card"><b style="color:var(--green)">${list.length}</b><span>shortlist</span></div>
     <div class="card"><b>${all.length}</b><span>vetted</span></div>
@@ -777,7 +795,7 @@ function renderPage() {
     <div class="card"><b>${passed}/${judged}</b><span>your passes</span></div>
   </div>
   <div class="box"><b>Funnel</b>
-    <div class="tline"><span>pulled from leaderboard</span><span>${f.boardPulled}</span></div>
+    <div class="tline"><span>smart traders pulled</span><span>${f.boardPulled}</span></div>
     <div class="tline"><span>already known / judged</span><span>${f.alreadyKnown}</span></div>
     <div class="tline"><span>pre-screened → rejected</span><span>${f.preScreened} → ${f.preRejected}</span></div>
     <div class="tline"><span>fully vetted → excluded</span><span>${f.vetted} → ${f.excluded}</span></div>
@@ -803,7 +821,7 @@ http.createServer(async (req, res) => {
      guessing at them. /probe with no args hits the leaderboard. */
   if (p === "/probe") {
     const q = u.searchParams.get("q")
-      || `/trader/gainers-losers?type=30d&sort_by=realized_pnl&sort_type=desc&offset=0&limit=3`;
+      || `/defi/token_trending?sort_by=volume24hUSD&sort_type=desc&offset=0&limit=3`;
     try {
       const j = await birdeye(q);
       res.writeHead(200, { "Content-Type": "application/json" });
@@ -846,7 +864,7 @@ http.createServer(async (req, res) => {
   res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
   res.end(renderPage());
 }).listen(CFG.PORT, () => {
-  console.log(`Wallet hunter v10.1 on ${CFG.PORT} — persistence ${persistOk ? "ON" : "OFF"}`);
+  console.log(`Wallet hunter v11 on ${CFG.PORT} — persistence ${persistOk ? "ON" : "OFF"}`);
   if (!CFG.KEY) { status = "FAILED: HELIUS_API_KEY not set"; return; }
   if (!CFG.BIRDEYE_KEY) { status = "FAILED: BIRDEYE_API_KEY not set"; return; }
   cycle();
