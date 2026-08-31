@@ -60,6 +60,13 @@ const CFG = {
   BOARD_MAX_OFFSET: Number(process.env.BOARD_MAX_OFFSET || 2000),
   BOARD_WINDOWS: (process.env.BOARD_WINDOWS || "30d,1W,90d")
     .split(",").map((s) => s.trim()).filter(Boolean),
+  /* sort on NET PnL. Sorting on realized_pnl surfaces an accounting artefact:
+     wallets holding a dust token with a garbage price book a vast "realised"
+     gain and an equal, opposite unrealised loss that cancel to nothing. The
+     top of that list was wallets with 3 trades and $15m of fictional PnL. */
+  BOARD_SORT: process.env.BOARD_SORT || "PnL",
+  BOARD_MIN_TRADES: Number(process.env.BOARD_MIN_TRADES || 20),
+  BOARD_MIRROR_RATIO: Number(process.env.BOARD_MIRROR_RATIO || 50),
 
   /* ── screening budget ── */
   MAX_VET_PER_CYCLE: Number(process.env.MAX_VET_PER_CYCLE || 12),
@@ -181,7 +188,7 @@ async function pullLeaderboard() {
   status = `leaderboard ${window} @${offset}`;
 
   const q = `/trader/gainers-losers?type=${encodeURIComponent(window)}`
-    + `&sort_by=realized_pnl&sort_type=desc`
+    + `&sort_by=${encodeURIComponent(CFG.BOARD_SORT)}&sort_type=desc`
     + `&offset=${offset}&limit=${CFG.BOARD_LIMIT}`;
 
   let j;
@@ -195,17 +202,38 @@ async function pullLeaderboard() {
     : Array.isArray(j?.items) ? j.items : [];
 
   const out = [];
+  const dropped = {};
+  const drop = (why) => { dropped[why] = (dropped[why] || 0) + 1; };
+
   for (const r of rows) {
     const addr = r?.address || r?.wallet || r?.owner || r?.trader || r?.account;
-    if (typeof addr !== "string" || addr.length < 32 || addr.length > 46) continue;
+    if (typeof addr !== "string" || addr.length < 32 || addr.length > 46) { drop("no address"); continue; }
+
+    const pnl = Number(r?.pnl ?? 0);
+    const realised = Number(r?.realized_pnl ?? r?.realizedPnl ?? 0);
+    const unrealised = Number(r?.unrealized_pnl ?? r?.unrealizedPnl ?? 0);
+    const trades = Number(r?.trade_count ?? r?.tradeCount ?? r?.trade ?? 0);
+
+    /* the mirror artefact: realised and unrealised are equal and opposite,
+       so the pair is fictional and the only real number is the tiny net */
+    if (Math.abs(pnl) > 0 && Math.abs(realised) > CFG.BOARD_MIRROR_RATIO * Math.abs(pnl)) {
+      drop("mirrored pnl (dust pricing)"); continue;
+    }
+    if (pnl <= 0) { drop("net pnl not positive"); continue; }
+    if (trades < CFG.BOARD_MIN_TRADES) { drop(`under ${CFG.BOARD_MIN_TRADES} trades`); continue; }
+
     out.push({
       wallet: addr,
-      boardPnl: Number(r?.pnl ?? r?.realized_pnl ?? r?.realizedPnl ?? 0),
+      boardPnl: +pnl.toFixed(2),
+      boardRealised: +realised.toFixed(2),
       boardVolume: Number(r?.volume ?? r?.volume_usd ?? r?.volumeUsd ?? 0),
-      boardTrades: Number(r?.trade_count ?? r?.tradeCount ?? r?.trade ?? 0),
+      boardTrades: trades,
       window,
     });
   }
+
+  const dropSummary = Object.entries(dropped).sort((a, b) => b[1] - a[1])
+    .map(([w, n]) => `${n}× ${w}`).join(", ");
 
   /* advance the cursor for next cycle */
   DB.boardOffset += CFG.BOARD_LIMIT;
@@ -215,8 +243,8 @@ async function pullLeaderboard() {
   }
 
   DB.funnel.boardPulled += out.length;
-  logLine(`  leaderboard ${window} @${offset}: ${out.length} traders`
-    + (rows.length && !out.length ? " (no address field matched — check /probe)" : ""));
+  logLine(`  leaderboard ${window} @${offset}: ${rows.length} rows → ${out.length} usable`
+    + (dropSummary ? ` · dropped: ${dropSummary}` : ""));
   return out;
 }
 
@@ -676,7 +704,7 @@ function renderPage() {
         <span class="score">${w.score}</span></div>
       <div class="meta"><b>${s.roiPct}% ROI</b> on ${s.matchedCostSol} SOL · ${s.winRatePct}% win · hold ${s.medianHoldMin}m · ${s.closed} round trips</div>
       <div class="meta">pool $${s.medianPoolUsd.toLocaleString()} · ${s.sizeRatio}x my stake · ${s.visiblePct}% visible · ${s.txCount}${s.txCeiling ? "+" : ""} txs · ${s.totalDays}d observed</div>
-      <div class="meta">from ${esc(w.board?.window || "?")} leaderboard · vetted ${ago(w.vettedAt)} · last traded ${ago(w.lastActiveTs)}</div>
+      <div class="meta">Birdeye ${esc(w.board?.window || "?")}: $${(w.board?.boardPnl ?? 0).toLocaleString()} net over ${w.board?.boardTrades ?? "?"} trades · vetted ${ago(w.vettedAt)} · last traded ${ago(w.lastActiveTs)}</div>
       <div class="meta mono">${esc(w.wallet)}</div>
       <div class="acts">
         <a class="gmgn" href="https://gmgn.ai/sol/address/${esc(w.wallet)}" target="_blank" rel="noopener">Check on GMGN ↗</a>
@@ -739,7 +767,7 @@ function renderPage() {
   .warn{background:#241A14;border:1px solid var(--amber);padding:10px 12px;margin-bottom:14px;color:var(--amber);font-size:11px}
 </style></head><body>
   <h1>Wallet <em>hunter</em></h1>
-  <div class="sub">v10 · wallet-first · Birdeye trader leaderboard → Helius vetting · cycle ${CFG.CYCLE_MINUTES}m · top ${CFG.SHORTLIST_SIZE} · ${persistOk ? "database saved ✓" : "IN MEMORY ONLY"} · <a href="/db.json" style="color:var(--green)">db.json</a> · <a href="/probe" style="color:var(--green)">probe</a></div>
+  <div class="sub">v10.1 · wallet-first · Birdeye net-PnL leaderboard → Helius vetting · cycle ${CFG.CYCLE_MINUTES}m · top ${CFG.SHORTLIST_SIZE} · ${persistOk ? "database saved ✓" : "IN MEMORY ONLY"} · <a href="/db.json" style="color:var(--green)">db.json</a> · <a href="/probe" style="color:var(--green)">probe</a></div>
   <div class="warn">A shortlist, not a verdict. Birdeye ranks these by realised PnL; the vetting below only sees one address over ${CFG.VET_DAYS} days. Check each on GMGN, then record pass/fail so the scoring learns which signals actually matter.</div>
   <div class="status">▶ ${esc(status)}<br>cycles: ${DB.cycles} (${ago(DB.lastCycleAt)}) · leaderboard at ${CFG.BOARD_WINDOWS[DB.boardWindowIdx % CFG.BOARD_WINDOWS.length]} offset ${DB.boardOffset} · queue ${DB.queue.length}</div>
   <div class="cards">
@@ -818,7 +846,7 @@ http.createServer(async (req, res) => {
   res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
   res.end(renderPage());
 }).listen(CFG.PORT, () => {
-  console.log(`Wallet hunter v10 on ${CFG.PORT} — persistence ${persistOk ? "ON" : "OFF"}`);
+  console.log(`Wallet hunter v10.1 on ${CFG.PORT} — persistence ${persistOk ? "ON" : "OFF"}`);
   if (!CFG.KEY) { status = "FAILED: HELIUS_API_KEY not set"; return; }
   if (!CFG.BIRDEYE_KEY) { status = "FAILED: BIRDEYE_API_KEY not set"; return; }
   cycle();
