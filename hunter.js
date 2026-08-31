@@ -1,47 +1,42 @@
 /**
- * WALLET HUNTER v9 — reachability-gated discovery
+ * WALLET HUNTER v10 — WALLET-FIRST. No coins.
  * ----------------------------------------------------------------
- * v1-v8 kept returning "0 patient winners" and I kept blaming the wrong
- * thing. The real fault was in the harvester all along:
+ * v1-v9 all had the same architectural mistake: they found COINS, then read
+ * each coin's transaction history to see who traded it. That meant
  *
- *   The harvester reads a coin's transactions NEWEST FIRST, 10 pages, 1000
- *   transactions. But the wallets worth finding bought EARLY — often days
- *   ago. On a coin doing 2,000 txs/day, 1000 transactions reaches back
- *   about twelve hours. The profitable entries sit outside the window and
- *   are simply invisible. Every coin then reports zero winners, and no
- *   amount of tuning liquidity or age thresholds changes that.
+ *   · every wallet found was one that happened to trade a coin we picked
+ *     (survivorship bias — pick a coin that pumped and every early buyer
+ *      looks like a genius),
+ *   · and we could only read coins whose whole history fits in ~15 Helius
+ *     pages, which excludes essentially every coin anyone actually trades.
  *
- * v9 fixes it with four changes:
+ * Yesterday's numbers: 120 pools scanned → 0 readable. Coins with 60,000+
+ * transactions need 600 pages. It was never going to work.
  *
- *   1. REACHABILITY GATE. GeckoTerminal returns 24h transaction counts in
- *      the same payload as liquidity. Multiply by pool age and you know,
- *      before spending a single Helius credit, whether the page budget can
- *      see the coin's whole history. Only reachable coins get harvested.
+ * v10 goes at it from the wallet end, which is what we wanted all along:
  *
- *   2. CHARACTER SELECTION, not ranking. Trending/top/new are all ranked by
- *      momentum, so picking from them means picking coins that already
- *      pumped — everyone who bought early looks like a genius. v9 pools all
- *      three lists and filters on SHAPE instead: 1-14 days old, steady
- *      rather than spiking, balanced buys and sells, moderate 24h move.
- *      Coins that grind upward slowly are where patient traders live.
+ *   Birdeye's /trader/gainers-losers ranks TRADERS by realised PnL over
+ *   1W / 30d / 90d, 100 per page, 10,000 deep. One call returns 100
+ *   profitable wallet addresses. No coins involved at any point.
  *
- *   3. SEEDED EXPANSION. Wallets found in a known-good wallet's coins were
- *      consistently the best-shaped ones. But expansion only fired once
- *      something scored ≥45, and nothing did — so the best source never ran.
- *      SEED_WALLETS primes it with wallets already verified on GMGN.
+ * The pipeline is now:
+ *   1. Pull a page of ranked profitable wallets from Birdeye (1 call)
+ *   2. Cheap pre-screen via 2 Helius pages — kills bots for 2 calls not 40
+ *   3. Full vet on survivors: quantity-matched FIFO, hard exclusions, score
+ *   4. Shortlist → your GMGN check → /verdict feedback
  *
- *   4. CHEAP PRE-SCREEN. Vetting spent 40 Helius pages per wallet, and most
- *      were excluded as machines — obvious from two pages. Pre-screening
- *      rejects those for 2 calls instead of 40, so the same credit budget
- *      vets far more candidates.
+ * Gone: coin discovery, harvesting, reachability gating, GeckoTerminal,
+ * the 429 storm, and the survivorship bias. The vetting engine — which was
+ * the part that actually worked, and which agreed with GMGN on HSdENm — is
+ * carried over unchanged.
  *
- * Everything downstream is unchanged: quantity-matched FIFO accounting, hard
- * exclusions, 0-100 scoring, top-N shortlist, /verdict feedback loop.
+ * NOTE ON BIRDEYE PnL: Birdeye also exposes wallet-level PnL endpoints. I
+ * have confirmed /trader/gainers-losers exactly, but not the request shape
+ * of the PnL endpoints, so v10 does NOT depend on them. There is a /probe
+ * route to dump raw Birdeye responses; once we have seen real output we can
+ * wire PnL enrichment in properly rather than guessing.
  *
- * Still true, and stated on the dashboard: this is a SHORTLIST GENERATOR.
- * It sees one address over 30 days. Check every candidate on GMGN.
- *
- * This service NEVER trades. It only reads the chain.
+ * This service NEVER trades. It only reads.
  */
 
 import http from "http";
@@ -50,45 +45,33 @@ import path from "path";
 
 const CFG = {
   KEY: process.env.HELIUS_API_KEY || "",
+  BIRDEYE_KEY: process.env.BIRDEYE_API_KEY || "",
   CONTROL_KEY: process.env.HUNTER_KEY || process.env.CONTROL_KEY || "",
   PORT: Number(process.env.PORT || 3000),
-  CYCLE_MINUTES: Number(process.env.CYCLE_MINUTES || 30),
+  CYCLE_MINUTES: Number(process.env.CYCLE_MINUTES || 20),
   DATA_DIR: process.env.DATA_DIR || "/data",
 
-  /* wallets you have already verified — seeds expansion from cycle 1 */
+  /* wallets already verified on GMGN — never re-vetted, used for expansion */
   SEED_WALLETS: (process.env.SEED_WALLETS || "")
     .split(",").map((s) => s.trim()).filter(Boolean),
 
-  /* ── coin character filter ── */
-  COIN_MIN_AGE_H: Number(process.env.COIN_MIN_AGE_H || 24),      // needs completed round trips
-  COIN_MAX_AGE_H: Number(process.env.COIN_MAX_AGE_H || 336),     // 14d — still in reach
-  COIN_MIN_LIQ: Number(process.env.COIN_MIN_LIQ || 25000),
-  COIN_MAX_LIQ: Number(process.env.COIN_MAX_LIQ || 800000),
-  COIN_MAX_CHG24: Number(process.env.COIN_MAX_CHG24 || 400),     // skip parabolic
-  COIN_MIN_CHG24: Number(process.env.COIN_MIN_CHG24 || -40),     // skip dying
-  COIN_MAX_BUY_RATIO: Number(process.env.COIN_MAX_BUY_RATIO || 2.5),
-  COIN_MIN_BUY_RATIO: Number(process.env.COIN_MIN_BUY_RATIO || 0.4),
+  /* ── Birdeye leaderboard discovery ── */
+  BOARD_LIMIT: Number(process.env.BOARD_LIMIT || 100),      // max 100
+  BOARD_MAX_OFFSET: Number(process.env.BOARD_MAX_OFFSET || 2000),
+  BOARD_WINDOWS: (process.env.BOARD_WINDOWS || "30d,1W,90d")
+    .split(",").map((s) => s.trim()).filter(Boolean),
 
-  /* ── reachability: the fix ── */
-  COIN_PAGES: Number(process.env.COIN_PAGES || 15),              // 1500 txs budget
-  MAX_EST_TXS: Number(process.env.MAX_EST_TXS || 1200),          // must fit the budget
-  MIN_EST_TXS: Number(process.env.MIN_EST_TXS || 120),           // needs some trading
+  /* ── screening budget ── */
+  MAX_VET_PER_CYCLE: Number(process.env.MAX_VET_PER_CYCLE || 12),
+  PRESCREEN_PAGES: Number(process.env.PRESCREEN_PAGES || 2),
+  WALLET_PAGES: Number(process.env.WALLET_PAGES || 40),
 
-  COINS_PER_CYCLE: Number(process.env.COINS_PER_CYCLE || 6),
-  EXPANSION_COINS: Number(process.env.EXPANSION_COINS || 5),
-  MAX_VET_PER_CYCLE: Number(process.env.MAX_VET_PER_CYCLE || 10),
-
-  /* execution liquidity — what YOU need to fill in */
+  /* execution reality */
   MIN_LIQ_USD: Number(process.env.MIN_LIQ_USD || 30000),
   MY_STAKE_SOL: Number(process.env.MY_STAKE_SOL || 0.3),
 
   VET_DAYS: Number(process.env.VET_DAYS || 30),
-  MIN_BUY_SOL: Number(process.env.MIN_BUY_SOL || 0.05),
-  MIN_HOLD_MIN: Number(process.env.MIN_HOLD_MIN || 10),
   MIN_MATCHED: Number(process.env.MIN_MATCHED || 5),
-  SNIPE_CUTOFF_S: Number(process.env.SNIPE_CUTOFF_S || 120),
-  WALLET_PAGES: Number(process.env.WALLET_PAGES || 40),
-  PRESCREEN_PAGES: Number(process.env.PRESCREEN_PAGES || 2),
   REVET_DAYS: Number(process.env.REVET_DAYS || 5),
   DORMANT_DAYS: Number(process.env.DORMANT_DAYS || 10),
   MAX_REVET_PER_CYCLE: Number(process.env.MAX_REVET_PER_CYCLE || 2),
@@ -101,6 +84,7 @@ const CFG = {
   HARD_MAX_SIZE_RATIO: Number(process.env.HARD_MAX_SIZE_RATIO || 20),
   HARD_MIN_VISIBLE_PCT: Number(process.env.HARD_MIN_VISIBLE_PCT || 30),
   MIN_DEPLOYED_SOL: Number(process.env.MIN_DEPLOYED_SOL || 3),
+  MIN_HOLD_MIN: Number(process.env.MIN_HOLD_MIN || 10),
 
   /* shortlist */
   SHORTLIST_SIZE: Number(process.env.SHORTLIST_SIZE || 5),
@@ -121,27 +105,11 @@ const SOL_MINT = "So11111111111111111111111111111111111111112";
 const QUOTES = new Set([SOL_MINT,
   "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
   "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"]);
-const PROGRAMS = new Set([
-  "11111111111111111111111111111111",
-  "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
-  "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL",
-  "ComputeBudget111111111111111111111111111111",
-  "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr",
-  "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",
-  "jitodontfront111111111111111111111nopainnogain",
-]);
 const MINT_TYPES = new Set(["TOKEN_MINT", "CREATE_POOL", "INITIALIZE_MINT"]);
 const LAMPORTS = 1e9;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const now = () => Math.floor(Date.now() / 1000);
 const DAY = 86400;
-
-/* all three lists are pooled, then filtered on character — no rotation */
-const POOL_LISTS = [
-  { path: "pools", pages: [1, 2, 3, 4], label: "top" },
-  { path: "new_pools", pages: [1, 2], label: "new" },
-  { path: "trending_pools", pages: [1, 2], label: "trending" },
-];
 
 /* ── persistence ────────────────────────────────────────── */
 
@@ -154,10 +122,11 @@ try {
 } catch { persistOk = false; }
 
 const DB = {
-  wallets: {}, seenCoins: {}, verdicts: {}, cycles: 0,
-  startedAt: now(), lastCycleAt: null, lastMode: null, log: [],
-  funnel: { poolsSeen: 0, poolsPassed: 0, coinsHarvested: 0, winnersFound: 0,
-            preScreened: 0, preRejected: 0, vetted: 0, excluded: 0 },
+  wallets: {}, verdicts: {}, queue: [], cycles: 0,
+  boardOffset: 0, boardWindowIdx: 0,
+  startedAt: now(), lastCycleAt: null, log: [],
+  funnel: { boardPulled: 0, alreadyKnown: 0, preScreened: 0, preRejected: 0,
+            vetted: 0, excluded: 0 },
 };
 
 function loadDb() {
@@ -165,9 +134,9 @@ function loadDb() {
   try {
     if (!fs.existsSync(DB_FILE)) return;
     Object.assign(DB, JSON.parse(fs.readFileSync(DB_FILE, "utf8")));
-    DB.verdicts ||= {};
-    DB.funnel ||= { poolsSeen: 0, poolsPassed: 0, coinsHarvested: 0, winnersFound: 0,
-                    preScreened: 0, preRejected: 0, vetted: 0, excluded: 0 };
+    DB.verdicts ||= {}; DB.queue ||= [];
+    DB.funnel ||= { boardPulled: 0, alreadyKnown: 0, preScreened: 0,
+                    preRejected: 0, vetted: 0, excluded: 0 };
   } catch (e) { console.warn("db load failed:", e.message); }
 }
 function saveDb() {
@@ -187,7 +156,71 @@ function logLine(msg) {
   console.log(msg);
 }
 
-/* ── chain helpers ──────────────────────────────────────── */
+/* ── Birdeye ────────────────────────────────────────────── */
+
+async function birdeye(pathAndQuery) {
+  const url = `https://public-api.birdeye.so${pathAndQuery}`;
+  const res = await fetch(url, {
+    headers: {
+      accept: "application/json",
+      "x-chain": "solana",
+      "X-API-KEY": CFG.BIRDEYE_KEY,
+    },
+  });
+  const text = await res.text();
+  if (!res.ok) throw new Error(`birdeye ${res.status}: ${text.slice(0, 180)}`);
+  try { return JSON.parse(text); }
+  catch { throw new Error(`birdeye returned non-JSON: ${text.slice(0, 180)}`); }
+}
+
+/* Pull one page of profitable traders. Rotates window and advances offset
+   each cycle so we work steadily deeper through the leaderboard. */
+async function pullLeaderboard() {
+  const window = CFG.BOARD_WINDOWS[DB.boardWindowIdx % CFG.BOARD_WINDOWS.length];
+  const offset = DB.boardOffset;
+  status = `leaderboard ${window} @${offset}`;
+
+  const q = `/trader/gainers-losers?type=${encodeURIComponent(window)}`
+    + `&sort_by=realized_pnl&sort_type=desc`
+    + `&offset=${offset}&limit=${CFG.BOARD_LIMIT}`;
+
+  let j;
+  try { j = await birdeye(q); }
+  catch (e) { logLine(`  leaderboard failed: ${e.message}`); return []; }
+
+  /* Be liberal about the response shape — take whichever array we find and
+     pull the address field under whatever name it uses. */
+  const rows = Array.isArray(j?.data?.items) ? j.data.items
+    : Array.isArray(j?.data) ? j.data
+    : Array.isArray(j?.items) ? j.items : [];
+
+  const out = [];
+  for (const r of rows) {
+    const addr = r?.address || r?.wallet || r?.owner || r?.trader || r?.account;
+    if (typeof addr !== "string" || addr.length < 32 || addr.length > 46) continue;
+    out.push({
+      wallet: addr,
+      boardPnl: Number(r?.pnl ?? r?.realized_pnl ?? r?.realizedPnl ?? 0),
+      boardVolume: Number(r?.volume ?? r?.volume_usd ?? r?.volumeUsd ?? 0),
+      boardTrades: Number(r?.trade_count ?? r?.tradeCount ?? r?.trade ?? 0),
+      window,
+    });
+  }
+
+  /* advance the cursor for next cycle */
+  DB.boardOffset += CFG.BOARD_LIMIT;
+  if (DB.boardOffset >= CFG.BOARD_MAX_OFFSET) {
+    DB.boardOffset = 0;
+    DB.boardWindowIdx++;
+  }
+
+  DB.funnel.boardPulled += out.length;
+  logLine(`  leaderboard ${window} @${offset}: ${out.length} traders`
+    + (rows.length && !out.length ? " (no address field matched — check /probe)" : ""));
+  return out;
+}
+
+/* ── Helius ─────────────────────────────────────────────── */
 
 async function heliusPage(address, before) {
   const url = `https://api.helius.xyz/v0/addresses/${address}/transactions?api-key=${CFG.KEY}&limit=100${before ? `&before=${before}` : ""}`;
@@ -300,209 +333,7 @@ function matchFIFO(m) {
   };
 }
 
-/* ── DISCOVERY: character + reachability ────────────────── */
-
-/* Judge a pool on SHAPE, and on whether we can actually read its history.
-   Returns { ok, why, coin } so rejections can be logged and tuned. */
-function judgePool(p, listLabel) {
-  const a = p.attributes || {};
-  const mint = (p.relationships?.base_token?.data?.id || "").replace("solana_", "");
-  if (!mint || QUOTES.has(mint)) return { ok: false, why: "no mint" };
-
-  const liq = Number(a.reserve_in_usd || 0);
-  const created = a.pool_created_at ? Date.parse(a.pool_created_at) / 1000 : null;
-  const ageH = created ? (now() - created) / 3600 : null;
-  if (ageH === null) return { ok: false, why: "no age" };
-
-  const buys = Number(a.transactions?.h24?.buys || 0);
-  const sells = Number(a.transactions?.h24?.sells || 0);
-  const txns24 = buys + sells;
-  const chg24 = Number(a.price_change_percentage?.h24 || 0);
-  const vol24 = Number(a.volume_usd?.h24 || 0);
-
-  /* reachability — the whole point of v9.
-     h24 rate × age overestimates for older coins (volume decays), which
-     errs toward skipping. That is the safe direction. */
-  const ageDays = Math.max(ageH / 24, 0.05);
-  const estTotal = Math.round(txns24 * ageDays);
-
-  const name = a.name || mint.slice(0, 8);
-  const coin = {
-    mint, name, liq: Math.round(liq), ageH: Math.round(ageH),
-    estTotal, txns24, chg24: Math.round(chg24), vol24: Math.round(vol24),
-    source: listLabel, via: listLabel,
-  };
-
-  if (ageH < CFG.COIN_MIN_AGE_H) return { ok: false, why: `${Math.round(ageH)}h old`, coin };
-  if (ageH > CFG.COIN_MAX_AGE_H) return { ok: false, why: `${Math.round(ageH / 24)}d old`, coin };
-  if (liq < CFG.COIN_MIN_LIQ) return { ok: false, why: `liq $${Math.round(liq / 1000)}K`, coin };
-  if (liq > CFG.COIN_MAX_LIQ) return { ok: false, why: `liq $${Math.round(liq / 1000)}K too deep`, coin };
-  if (!vol24) return { ok: false, why: "no 24h volume", coin };
-  if (estTotal > CFG.MAX_EST_TXS) return { ok: false, why: `~${estTotal} txs unreachable`, coin };
-  if (estTotal < CFG.MIN_EST_TXS) return { ok: false, why: `~${estTotal} txs too quiet`, coin };
-  if (chg24 > CFG.COIN_MAX_CHG24) return { ok: false, why: `+${Math.round(chg24)}% parabolic`, coin };
-  if (chg24 < CFG.COIN_MIN_CHG24) return { ok: false, why: `${Math.round(chg24)}% dying`, coin };
-  const ratio = sells > 0 ? buys / sells : 99;
-  if (ratio > CFG.COIN_MAX_BUY_RATIO) return { ok: false, why: `${ratio.toFixed(1)}:1 buys, pumping`, coin };
-  if (ratio < CFG.COIN_MIN_BUY_RATIO) return { ok: false, why: `${ratio.toFixed(1)}:1 buys, dumping`, coin };
-
-  return { ok: true, coin };
-}
-
-async function discoverCoins() {
-  const passed = [];
-  const rejected = {};
-  let seen = 0;
-
-  for (const list of POOL_LISTS) {
-    for (const page of list.pages) {
-      status = `discovering: ${list.label} p${page}`;
-      try {
-        const res = await fetch(
-          `https://api.geckoterminal.com/api/v2/networks/solana/${list.path}?page=${page}`,
-          { headers: { accept: "application/json" } }
-        );
-        if (!res.ok) {
-          logLine(`  ${list.label} p${page}: HTTP ${res.status}`);
-          await sleep(res.status === 429 ? 8000 : 3000);
-          continue;
-        }
-        const j = await res.json();
-        for (const p of j.data || []) {
-          seen++;
-          const v = judgePool(p, list.label);
-          if (v.ok) passed.push(v.coin);
-          else rejected[v.why] = (rejected[v.why] || 0) + 1;
-        }
-      } catch (e) { logLine(`  ${list.label} p${page} failed: ${e.message}`); }
-      await sleep(3000);
-    }
-  }
-
-  DB.funnel.poolsSeen += seen;
-  DB.funnel.poolsPassed += passed.length;
-
-  /* report the top rejection reasons so the filter can be tuned on evidence */
-  const top = Object.entries(rejected).sort((a, b) => b[1] - a[1]).slice(0, 4)
-    .map(([w, n]) => `${n}× ${w}`).join(", ");
-  logLine(`  scanned ${seen} pools → ${passed.length} readable${top ? ` · rejected: ${top}` : ""}`);
-
-  /* dedupe by mint, prefer unseen, then fewest estimated txs (most readable) */
-  const byMint = new Map();
-  for (const c of passed) if (!byMint.has(c.mint)) byMint.set(c.mint, c);
-  const all = [...byMint.values()];
-  const fresh = all.filter((c) => !DB.seenCoins[c.mint] || now() - DB.seenCoins[c.mint] > 5 * DAY);
-  const pool = fresh.length ? fresh : all;
-  pool.sort((a, b) => a.estTotal - b.estTotal);
-  return pool.slice(0, CFG.COINS_PER_CYCLE);
-}
-
-/* Expansion: coins traded by wallets we trust. Seeded so it works day one. */
-async function discoverExpansion() {
-  const scored = Object.values(DB.wallets)
-    .filter((w) => !w.excluded && !w.dormant && (w.score || 0) >= CFG.MIN_SCORE)
-    .sort((a, b) => (b.score || 0) - (a.score || 0))
-    .map((w) => w.wallet);
-  const verified = Object.entries(DB.verdicts)
-    .filter(([, v]) => v.result === "pass").map(([w]) => w);
-
-  const sources = [...new Set([...CFG.SEED_WALLETS, ...verified, ...scored])].slice(0, 5);
-  if (!sources.length) return [];
-
-  const coins = [];
-  const seen = new Set();
-  for (const g of sources) {
-    status = `expansion: coins traded by ${g.slice(0, 6)}…`;
-    const cutoff = now() - 21 * DAY;
-    let before = "";
-    let found = 0;
-    for (let page = 0; page < 8 && found < 3; page++) {
-      let batch;
-      try { batch = await heliusPage(g, before); } catch { break; }
-      if (batch === null) { page--; continue; }
-      if (!batch.length) break;
-      for (const tx of batch) {
-        if (tx.timestamp < cutoff) continue;
-        const { paid } = solLeg(tx, g);
-        if (paid < CFG.MIN_BUY_SOL) continue;
-        for (const tr of tx.tokenTransfers || []) {
-          if (!tr.mint || QUOTES.has(tr.mint)) continue;
-          if (tr.toUserAccount !== g) continue;
-          if (seen.has(tr.mint)) continue;
-          if (DB.seenCoins[tr.mint] && now() - DB.seenCoins[tr.mint] < 5 * DAY) continue;
-          seen.add(tr.mint);
-          coins.push({
-            mint: tr.mint, name: tr.mint.slice(0, 6), liq: 0, ageH: 0,
-            estTotal: 0, source: "expansion", via: `swims with ${g.slice(0, 6)}…`,
-          });
-          found++;
-        }
-      }
-      before = batch[batch.length - 1].signature;
-      await sleep(400);
-    }
-  }
-  return coins.slice(0, CFG.EXPANSION_COINS);
-}
-
-/* ── HARVEST ────────────────────────────────────────────── */
-
-async function harvestCoin(coin) {
-  const traders = {};
-  let before = "";
-  let firstSeen = null;
-  let reachedStart = false;
-  let pagesUsed = 0;
-
-  for (let page = 0; page < CFG.COIN_PAGES; page++) {
-    status = `harvest ${coin.name} p${page + 1}/${CFG.COIN_PAGES}`;
-    let batch;
-    try { batch = await heliusPage(coin.mint, before); } catch { break; }
-    if (batch === null) { page--; continue; }
-    if (!batch.length) { reachedStart = true; break; }
-    pagesUsed++;
-    for (const tx of batch) {
-      if (firstSeen === null || tx.timestamp < firstSeen) firstSeen = tx.timestamp;
-      const movers = new Set();
-      for (const tr of tx.tokenTransfers || []) {
-        if (tr.mint !== coin.mint) continue;
-        if (tr.toUserAccount) movers.add(tr.toUserAccount);
-        if (tr.fromUserAccount) movers.add(tr.fromUserAccount);
-      }
-      for (const w of movers) {
-        if (QUOTES.has(w) || PROGRAMS.has(w)) continue;
-        const d = mintDeltas(tx, w)[coin.mint];
-        if (!d) continue;
-        const { paid, recv } = solLeg(tx, w);
-        const t = (traders[w] ||= { buys: [], sells: [], movedOut: 0 });
-        if (d > 0 && paid >= CFG.MIN_BUY_SOL) t.buys.push({ ts: tx.timestamp, qty: d, sol: paid });
-        if (d < 0 && recv >= CFG.MIN_BUY_SOL) t.sells.push({ ts: tx.timestamp, qty: -d, sol: recv });
-      }
-    }
-    if (batch.length < 100) { reachedStart = true; break; }
-    before = batch[batch.length - 1].signature;
-    await sleep(350);
-  }
-
-  const winners = [];
-  for (const [w, m] of Object.entries(traders)) {
-    if (!m.buys.length || !m.sells.length) continue;
-    const r = matchFIFO(m);
-    if (!r.matchedQty || r.realised <= 0) continue;
-    if (r.matchedCost > 0 && r.realised / r.matchedCost < 0.05) continue;
-    const holdMin = r.holds.length ? r.holds.reduce((a, b) => a + b, 0) / r.holds.length : 0;
-    if (reachedStart && firstSeen !== null && r.firstBuy - firstSeen <= CFG.SNIPE_CUTOFF_S) continue;
-    if (holdMin < CFG.MIN_HOLD_MIN) continue;
-    winners.push({ wallet: w, profitSol: +r.realised.toFixed(3), holdMin: Math.round(holdMin) });
-  }
-  winners.sort((a, b) => b.profitSol - a.profitSol);
-  DB.seenCoins[coin.mint] = now();
-  DB.funnel.coinsHarvested++;
-  DB.funnel.winnersFound += winners.length;
-  return { winners: winners.slice(0, 8), pagesUsed, reachedStart, traders: Object.keys(traders).length };
-}
-
-/* ── PRE-SCREEN: kill machines for 2 calls, not 40 ──────── */
+/* ── PRE-SCREEN ─────────────────────────────────────────── */
 
 async function preScreen(wallet) {
   const txs = [];
@@ -519,16 +350,17 @@ async function preScreen(wallet) {
   }
   DB.funnel.preScreened++;
   if (txs.length < 10) return { ok: false, why: "barely used" };
-
   const span = txs[0].timestamp - txs[txs.length - 1].timestamp;
   if (span <= 0) return { ok: false, why: "no time span" };
   const perDay = txs.length / (span / DAY);
   if (perDay * CFG.VET_DAYS > CFG.MAX_TXS_30D) {
     return { ok: false, why: `~${Math.round(perDay)} txs/day` };
   }
-  /* must actually swap, not just receive spam */
   const swaps = txs.filter((t) => t.events?.swap || (t.tokenTransfers || []).length).length;
   if (swaps < 5) return { ok: false, why: "no swap activity" };
+  if (now() - txs[0].timestamp > CFG.DORMANT_DAYS * DAY) {
+    return { ok: false, why: "dormant" };
+  }
   return { ok: true, perDay: Math.round(perDay) };
 }
 
@@ -566,7 +398,7 @@ async function liquiditySample(mints) {
         out.push(pairs.length ? Number(pairs[0].liquidity?.usd) || 0 : 0);
       }
     } catch {}
-    await sleep(350);
+    await sleep(300);
   }
   return out;
 }
@@ -654,6 +486,7 @@ async function vetWallet(wallet) {
   if (closed.length < CFG.MIN_MATCHED) excludes.push(`only ${closed.length} round trips`);
   if (realisedTotal <= 0) excludes.push(`unprofitable in window`);
   if (matchedCostTotal < CFG.MIN_DEPLOYED_SOL) excludes.push(`only ${matchedCostTotal.toFixed(1)} SOL deployed`);
+  if (medHold < CFG.MIN_HOLD_MIN) excludes.push(`median hold ${medHold.toFixed(0)}m`);
 
   const sig = {
     roi: peak(roiPct, 0, 60, 400),
@@ -695,12 +528,11 @@ async function vetWallet(wallet) {
   };
 }
 
-function storeCard(card, provenance, source) {
+function storeCard(card, board) {
   const prev = DB.wallets[card.wallet];
   DB.wallets[card.wallet] = {
     ...card,
-    provenance: prev?.provenance || provenance,
-    source: prev?.source || source,
+    board: prev?.board || board || null,
     firstSeenAt: prev?.firstSeenAt || now(),
     prevScore: prev?.score ?? null,
   };
@@ -714,24 +546,6 @@ function shortlist() {
     .filter((w) => !DB.verdicts[w.wallet])
     .sort((a, b) => (b.score || 0) - (a.score || 0))
     .slice(0, CFG.SHORTLIST_SIZE);
-}
-
-function sourceStats() {
-  const rows = {};
-  for (const w of Object.values(DB.wallets)) {
-    const s = w.source || "unknown";
-    const r = (rows[s] ||= { seen: 0, excluded: 0, scoreSum: 0, scored: 0, pass: 0, fail: 0 });
-    r.seen++;
-    if (w.excluded) r.excluded++;
-    else { r.scoreSum += w.score || 0; r.scored++; }
-    const v = DB.verdicts[w.wallet];
-    if (v) (v.result === "pass" ? r.pass++ : r.fail++);
-  }
-  return Object.entries(rows).map(([id, r]) => ({
-    id, ...r,
-    meanScore: r.scored ? r.scoreSum / r.scored : 0,
-    exclPct: r.seen ? (r.excluded / r.seen) * 100 : 0,
-  })).sort((a, b) => b.meanScore - a.meanScore);
 }
 
 function verdictAnalysis() {
@@ -760,47 +574,32 @@ async function cycle() {
   if (running) return;
   running = true;
   const cycleNo = DB.cycles + 1;
-  /* expansion every other cycle — it is the best source, so use it hard */
-  const wantExpansion = cycleNo % 2 === 0;
-  const mode = wantExpansion ? "EXPANSION" : "DISCOVERY";
 
   try {
-    logLine(`cycle ${cycleNo} [${mode}]`);
-    let coins = wantExpansion ? await discoverExpansion() : await discoverCoins();
-    if (!coins.length && wantExpansion) {
-      logLine(`  no expansion coins — falling back to discovery`);
-      coins = await discoverCoins();
-    }
-    if (!coins.length) logLine(`  no coins passed the filter this cycle`);
+    logLine(`cycle ${cycleNo}`);
 
-    const candidates = new Map();
-    for (const c of coins) {
-      const h = await harvestCoin(c);
-      const detail = c.estTotal
-        ? `~${c.estTotal} est txs, ${c.ageH}h, $${Math.round(c.liq / 1000)}K`
-        : c.via;
-      logLine(`  ${c.name} [${detail}] → ${h.traders} traders, ${h.winners.length} winners${h.reachedStart ? " (full history)" : ` (${h.pagesUsed}p, partial)`}`);
-      for (const w of h.winners) {
-        const prev = candidates.get(w.wallet) || { hits: 0, profit: 0, via: c.via, source: c.source };
-        candidates.set(w.wallet, {
-          hits: prev.hits + 1, profit: +(prev.profit + w.profitSol).toFixed(3),
-          via: prev.via, source: prev.source,
-        });
+    /* top the queue up from the leaderboard when it runs low */
+    if (DB.queue.length < CFG.MAX_VET_PER_CYCLE) {
+      const board = await pullLeaderboard();
+      let added = 0, known = 0;
+      for (const t of board) {
+        if (DB.verdicts[t.wallet]) { known++; continue; }
+        if (CFG.SEED_WALLETS.includes(t.wallet)) { known++; continue; }
+        const prev = DB.wallets[t.wallet];
+        if (prev && now() - prev.vettedAt < 14 * DAY) { known++; continue; }
+        if (DB.queue.some((q) => q.wallet === t.wallet)) continue;
+        DB.queue.push(t);
+        added++;
       }
+      DB.funnel.alreadyKnown += known;
+      logLine(`  queued ${added} new (${known} already known) · queue ${DB.queue.length}`);
     }
 
-    const queue = [...candidates.entries()]
-      .filter(([w]) => {
-        if (DB.verdicts[w]) return false;
-        if (CFG.SEED_WALLETS.includes(w)) return false;
-        const known = DB.wallets[w];
-        return !known || now() - known.vettedAt > 14 * DAY;
-      })
-      .sort((a, b) => (b[1].hits - a[1].hits) || (b[1].profit - a[1].profit))
-      .slice(0, CFG.MAX_VET_PER_CYCLE);
+    const batch = DB.queue.splice(0, CFG.MAX_VET_PER_CYCLE);
+    logLine(`cycle ${cycleNo} — screening ${batch.length}`);
 
-    logLine(`cycle ${cycleNo} — ${queue.length} candidates to screen`);
-    for (const [w, meta] of queue) {
+    for (const t of batch) {
+      const w = t.wallet;
       try {
         status = `pre-screen ${w.slice(0, 6)}…`;
         const pre = await preScreen(w);
@@ -811,7 +610,7 @@ async function cycle() {
         }
         const card = await vetWallet(w);
         if (!card) { logLine(`  ${w.slice(0, 6)}… no usable positions`); continue; }
-        storeCard(card, `${meta.via} · ${meta.hits} coin(s)`, meta.source);
+        storeCard(card, t);
         logLine(card.excluded
           ? `  ${w.slice(0, 6)}… excluded — ${card.excludes.join(", ")}`
           : `  ${w.slice(0, 6)}… SCORE ${card.score} · ${card.stats.roiPct}% ROI on ${card.stats.matchedCostSol} SOL · ${card.stats.winRatePct}% win · hold ${card.stats.medianHoldMin}m · pool $${card.stats.medianPoolUsd.toLocaleString()}`);
@@ -826,7 +625,7 @@ async function cycle() {
       status = `re-vetting ${s.wallet.slice(0, 6)}…`;
       try {
         const card = await vetWallet(s.wallet);
-        if (card) storeCard(card, s.provenance, s.source);
+        if (card) storeCard(card, s.board);
       } catch {}
     }
 
@@ -836,14 +635,13 @@ async function cycle() {
 
     DB.cycles = cycleNo;
     DB.lastCycleAt = now();
-    DB.lastMode = mode;
     saveDb();
-    logLine(`cycle ${cycleNo} done — ${Object.keys(DB.wallets).length} known, ${shortlist().length} on shortlist`);
+    logLine(`cycle ${cycleNo} done — ${Object.keys(DB.wallets).length} vetted, ${shortlist().length} on shortlist, ${DB.queue.length} queued`);
   } catch (e) {
     logLine(`cycle ${cycleNo} error: ${e.message}`);
   } finally {
     running = false;
-    status = `sleeping ${CFG.CYCLE_MINUTES}m · next cycle ${(DB.cycles + 1) % 2 === 0 ? "EXPANSION" : "DISCOVERY"}`;
+    status = `sleeping ${CFG.CYCLE_MINUTES}m · queue ${DB.queue.length}`;
   }
 }
 
@@ -859,7 +657,6 @@ function renderPage() {
   const passed = Object.values(DB.verdicts).filter((v) => v.result === "pass").length;
   const excluded = all.filter((w) => w.excluded).length;
   const analysis = verdictAnalysis();
-  const sources = sourceStats();
   const f = DB.funnel;
 
   const ago = (ts) => {
@@ -879,7 +676,7 @@ function renderPage() {
         <span class="score">${w.score}</span></div>
       <div class="meta"><b>${s.roiPct}% ROI</b> on ${s.matchedCostSol} SOL · ${s.winRatePct}% win · hold ${s.medianHoldMin}m · ${s.closed} round trips</div>
       <div class="meta">pool $${s.medianPoolUsd.toLocaleString()} · ${s.sizeRatio}x my stake · ${s.visiblePct}% visible · ${s.txCount}${s.txCeiling ? "+" : ""} txs · ${s.totalDays}d observed</div>
-      <div class="meta">found via ${esc(w.provenance || "?")} · vetted ${ago(w.vettedAt)} · last traded ${ago(w.lastActiveTs)}</div>
+      <div class="meta">from ${esc(w.board?.window || "?")} leaderboard · vetted ${ago(w.vettedAt)} · last traded ${ago(w.lastActiveTs)}</div>
       <div class="meta mono">${esc(w.wallet)}</div>
       <div class="acts">
         <a class="gmgn" href="https://gmgn.ai/sol/address/${esc(w.wallet)}" target="_blank" rel="noopener">Check on GMGN ↗</a>
@@ -892,9 +689,6 @@ function renderPage() {
 
   const logRows = (DB.log || []).slice(0, 26).map((l) =>
     `<li class="logline">${esc(l.at.slice(11, 19))} · ${esc(l.msg)}</li>`).join("");
-
-  const sourceRows = sources.map((s) =>
-    `<div class="tline"><span>${esc(s.id)}</span><span>${s.seen} seen · ${s.exclPct.toFixed(0)}% excluded · mean ${s.meanScore.toFixed(0)}${(s.pass + s.fail) ? ` · ${s.pass}/${s.pass + s.fail} passed` : ""}</span></div>`).join("");
 
   const analysisRows = analysis ? analysis.rows.map((r) =>
     `<div class="tline"><span>${esc(r.key)}</span><span>${r.pass.toFixed(2)} vs ${r.fail.toFixed(2)} · gap ${r.gap >= 0 ? "+" : ""}${r.gap.toFixed(2)}</span></div>`).join("") : "";
@@ -945,9 +739,9 @@ function renderPage() {
   .warn{background:#241A14;border:1px solid var(--amber);padding:10px 12px;margin-bottom:14px;color:var(--amber);font-size:11px}
 </style></head><body>
   <h1>Wallet <em>hunter</em></h1>
-  <div class="sub">v9 · reachability-gated discovery · cycle ${CFG.CYCLE_MINUTES}m · top ${CFG.SHORTLIST_SIZE} · ${persistOk ? "database saved ✓" : "IN MEMORY ONLY"} · <a href="/db.json" style="color:var(--green)">db.json</a></div>
-  <div class="warn">A shortlist, not a verdict. This sees one address over ${CFG.VET_DAYS} days; operators who split flow across wallets still pass. Check each on GMGN, then record pass/fail so the scoring learns which signals actually matter.</div>
-  <div class="status">▶ ${esc(status)}<br>cycles: ${DB.cycles} (last ${DB.lastMode || "—"}, ${ago(DB.lastCycleAt)}) · coins scanned: ${Object.keys(DB.seenCoins).length} · wallets seen: ${all.length}</div>
+  <div class="sub">v10 · wallet-first · Birdeye trader leaderboard → Helius vetting · cycle ${CFG.CYCLE_MINUTES}m · top ${CFG.SHORTLIST_SIZE} · ${persistOk ? "database saved ✓" : "IN MEMORY ONLY"} · <a href="/db.json" style="color:var(--green)">db.json</a> · <a href="/probe" style="color:var(--green)">probe</a></div>
+  <div class="warn">A shortlist, not a verdict. Birdeye ranks these by realised PnL; the vetting below only sees one address over ${CFG.VET_DAYS} days. Check each on GMGN, then record pass/fail so the scoring learns which signals actually matter.</div>
+  <div class="status">▶ ${esc(status)}<br>cycles: ${DB.cycles} (${ago(DB.lastCycleAt)}) · leaderboard at ${CFG.BOARD_WINDOWS[DB.boardWindowIdx % CFG.BOARD_WINDOWS.length]} offset ${DB.boardOffset} · queue ${DB.queue.length}</div>
   <div class="cards">
     <div class="card"><b style="color:var(--green)">${list.length}</b><span>shortlist</span></div>
     <div class="card"><b>${all.length}</b><span>vetted</span></div>
@@ -955,12 +749,11 @@ function renderPage() {
     <div class="card"><b>${passed}/${judged}</b><span>your passes</span></div>
   </div>
   <div class="box"><b>Funnel</b>
-    <div class="tline"><span>pools scanned → readable</span><span>${f.poolsSeen} → ${f.poolsPassed}</span></div>
-    <div class="tline"><span>coins harvested → winners</span><span>${f.coinsHarvested} → ${f.winnersFound}</span></div>
+    <div class="tline"><span>pulled from leaderboard</span><span>${f.boardPulled}</span></div>
+    <div class="tline"><span>already known / judged</span><span>${f.alreadyKnown}</span></div>
     <div class="tline"><span>pre-screened → rejected</span><span>${f.preScreened} → ${f.preRejected}</span></div>
     <div class="tline"><span>fully vetted → excluded</span><span>${f.vetted} → ${f.excluded}</span></div>
   </div>
-  ${sourceRows ? `<div class="box"><b>Which source is producing</b>${sourceRows}</div>` : ""}
   <h2>🎯 Check these (top ${CFG.SHORTLIST_SIZE})</h2>
   ${list.length ? `<ul>${list.map((w, i) => card(w, i + 1)).join("")}</ul>`
     : `<div class="none">Nothing scoring ≥${CFG.MIN_SCORE} yet.</div>`}
@@ -974,9 +767,24 @@ function renderPage() {
 
 /* ── server + loop ──────────────────────────────────────── */
 
-http.createServer((req, res) => {
+http.createServer(async (req, res) => {
   const u = new URL(req.url, "http://x");
   const p = u.pathname;
+
+  /* Dump a raw Birdeye response so we can confirm field names rather than
+     guessing at them. /probe with no args hits the leaderboard. */
+  if (p === "/probe") {
+    const q = u.searchParams.get("q")
+      || `/trader/gainers-losers?type=30d&sort_by=realized_pnl&sort_type=desc&offset=0&limit=3`;
+    try {
+      const j = await birdeye(q);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      return res.end(JSON.stringify({ query: q, response: j }, null, 2));
+    } catch (e) {
+      res.writeHead(502, { "Content-Type": "application/json" });
+      return res.end(JSON.stringify({ query: q, error: e.message }, null, 2));
+    }
+  }
 
   if (p === "/verdict") {
     const wallet = u.searchParams.get("wallet") || "";
@@ -990,7 +798,7 @@ http.createServer((req, res) => {
       res.writeHead(400, { "Content-Type": "text/plain" });
       return res.end("need ?wallet=<known wallet>&result=pass|fail");
     }
-    DB.verdicts[wallet] = { result, at: now(), source: DB.wallets[wallet].source || null };
+    DB.verdicts[wallet] = { result, at: now() };
     logLine(`verdict: ${wallet.slice(0, 6)}… ${result.toUpperCase()} (your GMGN check)`);
     saveDb();
     res.writeHead(302, { Location: "/" });
@@ -999,7 +807,7 @@ http.createServer((req, res) => {
 
   if (p === "/db.json") {
     res.writeHead(200, { "Content-Type": "application/json" });
-    return res.end(JSON.stringify({ status, cycles: DB.cycles, funnel: DB.funnel, verdicts: DB.verdicts, wallets: DB.wallets }, null, 2));
+    return res.end(JSON.stringify({ status, cycles: DB.cycles, funnel: DB.funnel, queued: DB.queue.length, verdicts: DB.verdicts, wallets: DB.wallets }, null, 2));
   }
   if (p === "/shortlist.txt") {
     res.writeHead(200, { "Content-Type": "text/plain" });
@@ -1010,9 +818,9 @@ http.createServer((req, res) => {
   res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
   res.end(renderPage());
 }).listen(CFG.PORT, () => {
-  console.log(`Wallet hunter v9 on ${CFG.PORT} — persistence ${persistOk ? "ON" : "OFF"}`);
-  if (CFG.SEED_WALLETS.length) console.log(`seeded with ${CFG.SEED_WALLETS.length} wallet(s)`);
+  console.log(`Wallet hunter v10 on ${CFG.PORT} — persistence ${persistOk ? "ON" : "OFF"}`);
   if (!CFG.KEY) { status = "FAILED: HELIUS_API_KEY not set"; return; }
+  if (!CFG.BIRDEYE_KEY) { status = "FAILED: BIRDEYE_API_KEY not set"; return; }
   cycle();
   setInterval(cycle, CFG.CYCLE_MINUTES * 60 * 1000);
 });
