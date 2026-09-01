@@ -175,6 +175,10 @@ try {
   persistOk = true;
 } catch { persistOk = false; }
 
+/* live trace state, so the page can show progress instead of a blank screen */
+const TRACE = { running: false, startedAt: 0, mints: [], done: 0, step: "idle",
+                result: null, error: null, finishedAt: 0 };
+
 const DB = {
   wallets: {}, verdicts: {}, queue: [], cycles: 0,
   tokenOffset: 0,
@@ -869,6 +873,7 @@ async function coinBuyers(mint) {
   let pages = 0, reachedStart = false;
   for (let page = 0; page < CFG.TRACE_PAGES; page++) {
     status = `trace ${mint.slice(0, 6)}… p${page + 1}`;
+    TRACE.step = `reading coin ${TRACE.done + 1}/${TRACE.mints.length} (${mint.slice(0, 6)}…) page ${page + 1}/${CFG.TRACE_PAGES} · ${buyers.size} buyers so far`;
     let batch;
     try { batch = await heliusPage(mint, before); } catch { break; }
     if (batch === null) { page--; continue; }
@@ -904,6 +909,7 @@ async function traceCoins(mints) {
   for (const mint of mints.slice(0, CFG.TRACE_MAX_COINS)) {
     const r = await coinBuyers(mint);
     perCoin.push({ mint, ...r });
+    TRACE.done++;
     logLine(`  trace ${mint.slice(0, 6)}…: ${r.buyers.size} buyers over ${r.pages}p${r.reachedStart ? " (full history)" : " (partial)"}`);
     await sleep(400);
   }
@@ -919,6 +925,7 @@ async function traceCoins(mints) {
     }
   }
 
+  TRACE.step = "intersecting buyers";
   const ranked = [...tally.values()]
     .filter((t) => t.coins.length >= 2)
     .map((t) => ({
@@ -1027,6 +1034,10 @@ function renderPage() {
   <h1>Wallet <em>hunter</em></h1>
   <div class="sub">v13 · co-occurrence + smart_trader + /trace → Helius vetting · cycle ${CFG.CYCLE_MINUTES}m · top ${CFG.SHORTLIST_SIZE} · ${persistOk ? "database saved ✓" : "IN MEMORY ONLY"} · <a href="/db.json" style="color:var(--green)">db.json</a> · <a href="/probe" style="color:var(--green)">probe</a> · <a href="/trace" style="color:var(--green)">trace</a></div>
   <div class="warn">A shortlist, not a verdict. Birdeye tags these as non-bot smart traders; the vetting below only sees one address over ${CFG.VET_DAYS} days. Check each on GMGN, then record pass/fail so the scoring learns which signals actually matter.</div>
+  ${TRACE.running ? `<div class="box" style="border-color:var(--amber)"><b style="color:var(--amber)">Trace running</b>
+    <div class="tline"><span>${esc(TRACE.step)}</span><span>${Math.round((Date.now()-TRACE.startedAt)/1000)}s</span></div></div>`
+    : TRACE.result ? `<div class="box"><b>Last trace</b>
+    <div class="tline"><span>${TRACE.result.walletsInTwoOrMore} wallets in 2+ coins</span><span><a href="/trace" style="color:var(--green)">view</a></span></div></div>` : ""}
   <div class="status">▶ ${esc(status)}<br>cycles: ${DB.cycles} (${ago(DB.lastCycleAt)}) · sources: co-occurrence + Birdeye smart_trader · trusted seeds: ${trustedWallets().length} · queue ${DB.queue.length}</div>
   <div class="cards">
     <div class="card"><b style="color:var(--green)">${list.length}</b><span>shortlist</span></div>
@@ -1091,68 +1102,115 @@ http.createServer(async (req, res) => {
     return res.end();
   }
 
-  /* /trace?mints=A,B,C[,D]  — wallets that bought several named coins.
-     Add &queue=1 to push the top hits into the vetting queue. */
+  /* /trace?mints=A,B,C  — starts in the BACKGROUND and returns immediately.
+     Reload the same URL (or /trace with no mints) to watch progress. */
   if (p === "/trace") {
-    const mints = (u.searchParams.get("mints") || "")
-      .split(",").map((s) => s.trim()).filter((s) => s.length >= 32 && s.length <= 46);
     const key = u.searchParams.get("key") || "";
     if (CFG.CONTROL_KEY && key !== CFG.CONTROL_KEY) {
       res.writeHead(403, { "Content-Type": "text/plain" });
       return res.end("bad key");
     }
-    if (mints.length < 2) {
-      res.writeHead(400, { "Content-Type": "text/plain" });
-      return res.end("need ?mints=<mint1>,<mint2>[,...]&key=... (2-8 mints)");
-    }
-    if (running) {
-      res.writeHead(429, { "Content-Type": "text/plain" });
-      return res.end("a cycle is running — try again in a minute");
-    }
-    running = true;
-    try {
-      logLine(`trace: ${mints.length} coins`);
-      const out = await traceCoins(mints);
-      const wantQueue = u.searchParams.get("queue") === "1";
-      let queued = 0;
-      if (wantQueue) {
-        for (const t of out.ranked.slice(0, 10)) {
-          if (DB.verdicts[t.wallet]) continue;
-          if (DB.queue.some((q) => q.wallet === t.wallet)) continue;
-          DB.queue.push({
-            wallet: t.wallet, boardPnl: 0, boardVolume: 0, boardTrades: 0,
-            cooc: t.hits, window: `traced ×${t.hits} coins`,
-          });
-          queued++;
-        }
-        saveDb();
-      }
-      const top = out.ranked.slice(0, 25).map((t) => ({
-        wallet: t.wallet,
-        boughtCoins: t.hits,
-        avgBuySol: t.avgSol,
-        buys: t.coins.map((c) => ({
-          coin: c.mint.slice(0, 8) + "…",
-          at: new Date(c.at * 1000).toISOString().replace("T", " ").slice(0, 19) + "Z",
-          sol: c.sol,
-        })).sort((a, b) => a.at.localeCompare(b.at)),
-        gmgn: `https://gmgn.ai/sol/address/${t.wallet}`,
-      }));
-      logLine(`trace done: ${out.ranked.length} wallets in 2+ coins${wantQueue ? `, ${queued} queued` : ""}`);
+    const mints = (u.searchParams.get("mints") || "")
+      .split(",").map((s) => s.trim()).filter((s) => s.length >= 32 && s.length <= 46);
+
+    const elapsed = TRACE.startedAt ? Math.round((Date.now() - TRACE.startedAt) / 1000) : 0;
+
+    /* already running → report progress */
+    if (TRACE.running) {
       res.writeHead(200, { "Content-Type": "application/json" });
       return res.end(JSON.stringify({
-        coins: out.perCoin,
-        walletsInTwoOrMore: out.ranked.length,
-        queued: wantQueue ? queued : undefined,
-        top,
+        state: "RUNNING",
+        elapsedSeconds: elapsed,
+        coinsDone: `${TRACE.done}/${TRACE.mints.length}`,
+        doingNow: TRACE.step,
+        note: "Reload this page to refresh progress. Result appears here when done.",
       }, null, 2));
-    } catch (e) {
-      res.writeHead(500, { "Content-Type": "text/plain" });
-      return res.end(`trace failed: ${e.message}`);
-    } finally {
-      running = false;
-      status = `sleeping ${CFG.CYCLE_MINUTES}m · queue ${DB.queue.length}`;
     }
+
+    /* no mints given → show the last result, or explain how to start */
+    if (!mints.length) {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      return res.end(JSON.stringify(
+        TRACE.result || TRACE.error
+          ? { state: TRACE.error ? "FAILED" : "DONE",
+              finishedSecondsAgo: Math.round((Date.now() - TRACE.finishedAt) / 1000),
+              error: TRACE.error || undefined,
+              ...(TRACE.result || {}) }
+          : { state: "IDLE",
+              howToStart: "/trace?key=YOURKEY&mints=<mint1>,<mint2>,<mint3>",
+              note: "2-8 mints, comma separated, no spaces. Add &queue=1 to auto-queue the top hits for vetting." },
+        null, 2));
+    }
+
+    if (mints.length < 2) {
+      res.writeHead(400, { "Content-Type": "text/plain" });
+      return res.end("need at least 2 mints");
+    }
+    if (running) {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      return res.end(JSON.stringify({
+        state: "WAITING",
+        note: "A vetting cycle is using Helius right now. Reload in a minute and it will start.",
+      }, null, 2));
+    }
+
+    /* start it in the background and answer straight away */
+    running = true;
+    TRACE.running = true; TRACE.startedAt = Date.now(); TRACE.mints = mints;
+    TRACE.done = 0; TRACE.step = "starting"; TRACE.result = null; TRACE.error = null;
+    const wantQueue = u.searchParams.get("queue") === "1";
+
+    (async () => {
+      try {
+        logLine(`trace: ${mints.length} coins`);
+        const out = await traceCoins(mints);
+        let queued = 0;
+        if (wantQueue) {
+          for (const t of out.ranked.slice(0, 10)) {
+            if (DB.verdicts[t.wallet]) continue;
+            if (DB.queue.some((q) => q.wallet === t.wallet)) continue;
+            DB.queue.push({
+              wallet: t.wallet, boardPnl: 0, boardVolume: 0, boardTrades: 0,
+              cooc: t.hits, window: `traced ×${t.hits} coins`,
+            });
+            queued++;
+          }
+          saveDb();
+        }
+        TRACE.result = {
+          coins: out.perCoin,
+          walletsInTwoOrMore: out.ranked.length,
+          queued: wantQueue ? queued : undefined,
+          top: out.ranked.slice(0, 25).map((t) => ({
+            wallet: t.wallet,
+            boughtCoins: t.hits,
+            avgBuySol: t.avgSol,
+            buys: t.coins.map((c) => ({
+              coin: c.mint.slice(0, 8) + "…",
+              at: new Date(c.at * 1000).toISOString().replace("T", " ").slice(0, 19) + "Z",
+              sol: c.sol,
+            })).sort((a, b) => a.at.localeCompare(b.at)),
+            gmgn: `https://gmgn.ai/sol/address/${t.wallet}`,
+          })),
+        };
+        logLine(`trace done: ${out.ranked.length} wallets in 2+ coins${wantQueue ? `, ${queued} queued` : ""}`);
+      } catch (e) {
+        TRACE.error = e.message;
+        logLine(`trace failed: ${e.message}`);
+      } finally {
+        TRACE.running = false; TRACE.finishedAt = Date.now(); TRACE.step = "done";
+        running = false;
+        status = `sleeping ${CFG.CYCLE_MINUTES}m · queue ${DB.queue.length}`;
+      }
+    })();
+
+    res.writeHead(200, { "Content-Type": "application/json" });
+    return res.end(JSON.stringify({
+      state: "STARTED",
+      coins: mints.length,
+      note: `Reading up to ${CFG.TRACE_PAGES} pages per coin — expect roughly ${mints.length} to ${mints.length * 2} minutes.`,
+      next: "Reload this same URL to watch progress and get the result.",
+    }, null, 2));
   }
 
   if (p === "/db.json") {
