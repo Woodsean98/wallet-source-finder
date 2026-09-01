@@ -1,5 +1,5 @@
 /**
- * WALLET HUNTER v13 — three ways to find a wallet
+ * WALLET HUNTER v14 — three ways to find a wallet, plus early-buyer tracing
  * ----------------------------------------------------------------
  * v1-v9 all shared one architectural mistake: they found COINS, then read
  * each coin's transaction history to see who traded it. That meant every
@@ -20,30 +20,28 @@
  *   1. CO-OCCURRENCE (the main one). Take wallets already trusted, find the
  *      coins they recently bought, read only recent pages of each coin near
  *      the seed's buy, and queue wallets appearing in several of them.
- *      Repeat co-occurrence is size-blind — a small trader who keeps turning
- *      up beside a good wallet ranks the same as a whale. First run turned
- *      724 neighbours into 31 candidates. Anything marked ✓ passed becomes a
- *      new seed, so the search widens the longer it runs.
  *
- *   2. /trace — for callers. People who post coin calls in Telegram buy
- *      BEFORE they post. Give /trace the coins someone called and it returns
- *      the wallets that bought several of them, with the timestamp and SOL
- *      size of every buy so the caller can be told apart from the snipers
- *      who front-run the same group. One coin has ~1,400 buyers; four coins
- *      in common has almost none.
+ *   2. /trace — wallets common to a set of coins you name.
  *
- *   3. Birdeye smart_trader — kept as a fallback when there is nothing
- *      trusted to mine from yet.
+ *   3. Birdeye smart_trader — kept as a fallback.
  *
- * Everything then flows through the same vetting engine, which is the part
- * that actually worked and which has agreed with GMGN on every wallet since
- * the FIFO fix: cheap pre-screen (2 Helius pages kills a bot for 2 calls
- * instead of 40), quantity-matched FIFO accounting, hard exclusions, 0-100
- * scoring, shortlist, and the /verdict feedback loop.
+ * v14 fixes /trace for the job it is actually needed for: finding who was
+ * EARLY into coins that later ran. Reading a mint's history newest-first with
+ * a page cap returns the LAST trades — the exit liquidity — never the early
+ * buyers. Every pump.fun coin's pre-graduation trades go through its bonding
+ * curve PDA, whose history ENDS at graduation (~$69k mc), so it is small and
+ * entirely early. Curve mode walks that address's signatures via RPC (1,000
+ * per call), keeps the oldest EARLY_TXS, parses only those, and returns
+ * buyers in chronological order with a buy rank. A CONTROL list of dead
+ * coins penalises wallets that are early into everything (bots), and wallets
+ * that CREATED any traced coin are flagged. Non-pump coins fall back to the
+ * old mint-history read.
  *
- * It remains a SHORTLIST, not a verdict. It sees one address over 30 days;
- * operators who split flow across wallets still pass. Check every candidate
- * on GMGN and record pass/fail so the scoring learns which signals matter.
+ * Also fixed: MIN_BUY_SOL was referenced but never defined, so dust buys were
+ * never filtered anywhere.
+ *
+ * It remains a SHORTLIST, not a verdict. Check every candidate on GMGN and
+ * record pass/fail so the scoring learns which signals matter.
  *
  * This service NEVER trades. It only reads.
  */
@@ -64,45 +62,31 @@ const CFG = {
   SEED_WALLETS: (process.env.SEED_WALLETS || "")
     .split(",").map((s) => s.trim()).filter(Boolean),
 
-  /* ── Birdeye discovery ──
-     The net-PnL leaderboard ranks by ABSOLUTE profit, so its top is MEV bots
-     and market makers — measured at 909,474 txs/day and 337,273x the stake.
-     Ranking by size can never surface someone trading GBP100 positions well.
-     So v11 asks Birdeye for SMART TRADERS per token instead: their own tag,
-     defined as a non-bot wallet in the top realised PnL over 90 days with
-     over $10,000 realised, with bots excluded before ranking. */
+  /* smallest SOL leg that counts as a real buy anywhere in this file */
+  MIN_BUY_SOL: Number(process.env.MIN_BUY_SOL || 0.02),
+
+  /* ── Birdeye discovery ── */
   TOKENS_PER_CYCLE: Number(process.env.TOKENS_PER_CYCLE || 8),
   TRADERS_PER_TOKEN: Number(process.env.TRADERS_PER_TOKEN || 10),  // max 10
   TRADER_WINDOW: process.env.TRADER_WINDOW || "30d",
   TRADER_SORT: process.env.TRADER_SORT || "realized_pnl",
   WALLET_TAGS: process.env.WALLET_TAGS || "smart_trader",
-  /* optional manual token list; when set, trending is not called */
   TOKENS: (process.env.TOKENS || "").split(",").map((s) => s.trim()).filter(Boolean),
 
-  /* ── CO-OCCURRENCE (v12) ──
-     Every ranking-based source selects for capital, so it only ever returns
-     whales. This asks a different question entirely: which wallets keep
-     turning up in the SAME coins as a wallet we already trust? Repeat
-     co-occurrence is independent of size — a small trader who appears
-     alongside a good wallet across several coins is exactly the target.
-     Only RECENT pages of each coin are read, so it works on busy coins
-     where full-history harvesting was impossible, and "traded near when my
-     good wallet did" is a stronger signal than "traded this coin ever". */
-  SEED_COIN_PAGES: Number(process.env.SEED_COIN_PAGES || 6),   // recent pages per seed wallet
-  SEED_COINS: Number(process.env.SEED_COINS || 6),             // coins per seed wallet
-  COOC_PAGES: Number(process.env.COOC_PAGES || 4),             // recent pages per coin
-  COOC_WINDOW_H: Number(process.env.COOC_WINDOW_H || 48),      // +/- hours around seed's buy
-  COOC_MIN_HITS: Number(process.env.COOC_MIN_HITS || 2),       // coins in common to qualify
-  COOC_EVERY: Number(process.env.COOC_EVERY || 2),             // run every N cycles
+  /* ── CO-OCCURRENCE (v12) ── */
+  SEED_COIN_PAGES: Number(process.env.SEED_COIN_PAGES || 6),
+  SEED_COINS: Number(process.env.SEED_COINS || 6),
+  COOC_PAGES: Number(process.env.COOC_PAGES || 4),
+  COOC_WINDOW_H: Number(process.env.COOC_WINDOW_H || 48),
+  COOC_MIN_HITS: Number(process.env.COOC_MIN_HITS || 2),
+  COOC_EVERY: Number(process.env.COOC_EVERY || 2),
 
-  /* ── TRACE (v13) ──
-     Callers in Telegram groups buy BEFORE they post. Give /trace the coins
-     someone called and it returns the wallets that bought ALL of them. One
-     coin has thousands of buyers; four coins in common has almost none, so
-     the intersection is the caller (or their cluster). This is the same
-     co-occurrence maths, aimed at coins you name rather than a seed's. */
-  TRACE_PAGES: Number(process.env.TRACE_PAGES || 25),   // pages per coin
-  TRACE_MAX_COINS: Number(process.env.TRACE_MAX_COINS || 8),
+  /* ── TRACE (v13/v14) ── */
+  TRACE_PAGES: Number(process.env.TRACE_PAGES || 25),          // legacy mint-history mode: pages per coin
+  TRACE_MAX_COINS: Number(process.env.TRACE_MAX_COINS || 40),  // winners per trace
+  TRACE_MAX_CONTROL: Number(process.env.TRACE_MAX_CONTROL || 60), // control (dead) coins per trace
+  CURVE_SIG_PAGES: Number(process.env.CURVE_SIG_PAGES || 40),  // 1,000 sigs per page -> 40k txs max per curve
+  EARLY_TXS: Number(process.env.EARLY_TXS || 400),             // earliest transactions kept per coin
   BOARD_MIN_TRADES: Number(process.env.BOARD_MIN_TRADES || 20),
   BOARD_MIRROR_RATIO: Number(process.env.BOARD_MIRROR_RATIO || 50),
 
@@ -147,6 +131,7 @@ const CFG = {
 };
 
 const SOL_MINT = "So11111111111111111111111111111111111111112";
+const PUMP_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
 const QUOTES = new Set([SOL_MINT,
   "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
   "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"]);
@@ -156,7 +141,7 @@ const PROGRAMS = new Set([
   "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL",
   "ComputeBudget111111111111111111111111111111",
   "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr",
-  "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",
+  PUMP_PROGRAM,
   "jitodontfront111111111111111111111nopainnogain",
 ]);
 const MINT_TYPES = new Set(["TOKEN_MINT", "CREATE_POOL", "INITIALIZE_MINT"]);
@@ -176,7 +161,7 @@ try {
 } catch { persistOk = false; }
 
 /* live trace state, so the page can show progress instead of a blank screen */
-const TRACE = { running: false, startedAt: 0, mints: [], done: 0, step: "idle",
+const TRACE = { running: false, startedAt: 0, mints: [], control: [], done: 0, step: "idle",
                 result: null, error: null, finishedAt: 0 };
 
 const DB = {
@@ -231,7 +216,6 @@ async function birdeye(pathAndQuery) {
   catch { throw new Error(`birdeye returned non-JSON: ${text.slice(0, 180)}`); }
 }
 
-/* Tokens to ask about. Birdeye's own trending list, or a manual TOKENS list. */
 async function pullTokens() {
   if (CFG.TOKENS.length) return CFG.TOKENS.slice(0, CFG.TOKENS_PER_CYCLE);
   status = "fetching trending tokens";
@@ -254,8 +238,6 @@ async function pullTokens() {
   return out.slice(0, CFG.TOKENS_PER_CYCLE);
 }
 
-/* Ask Birdeye for the SMART TRADERS of one token. Bots are excluded by the
-   tag itself, so we never spend Helius calls discovering they were bots. */
 async function pullSmartTraders(token) {
   const q = `/defi/v2/tokens/top_traders?address=${encodeURIComponent(token.address)}`
     + `&time_frame=${encodeURIComponent(CFG.TRADER_WINDOW)}`
@@ -290,7 +272,6 @@ async function pullSmartTraders(token) {
   return out;
 }
 
-/* One discovery pass: tokens -> smart traders -> dedupe -> queue */
 async function pullCandidates() {
   const tokens = await pullTokens();
   if (!tokens.length) return [];
@@ -313,12 +294,7 @@ async function pullCandidates() {
   return out;
 }
 
-/* ── CO-OCCURRENCE DISCOVERY ────────────────────────────
-   1. For each trusted wallet, find the coins it recently bought.
-   2. For each of those coins, read only the RECENT pages.
-   3. Count which other wallets bought the same coin near the same time.
-   4. Wallets appearing across >= COOC_MIN_HITS coins go into the queue,
-      ranked by how many they share. Size never enters into it. */
+/* ── CO-OCCURRENCE DISCOVERY ──────────────────────────── */
 
 function trustedWallets() {
   const verified = Object.entries(DB.verdicts)
@@ -330,7 +306,6 @@ function trustedWallets() {
   return [...new Set([...CFG.SEED_WALLETS, ...verified, ...scored])].slice(0, 4);
 }
 
-/* coins a trusted wallet bought recently, with the timestamp it bought at */
 async function seedCoins(seed) {
   const coins = new Map();
   let before = "";
@@ -356,7 +331,6 @@ async function seedCoins(seed) {
   return [...coins.values()].slice(0, CFG.SEED_COINS);
 }
 
-/* wallets that bought the same coin within COOC_WINDOW_H of the seed */
 async function coinNeighbours(coin) {
   const found = new Set();
   const lo = coin.at - CFG.COOC_WINDOW_H * 3600;
@@ -389,7 +363,7 @@ async function coinNeighbours(coin) {
     }
     const oldest = batch[batch.length - 1].timestamp;
     before = batch[batch.length - 1].signature;
-    if (oldest < lo && !anyInWindow) break;   // paged past the window
+    if (oldest < lo && !anyInWindow) break;
     if (batch.length < 100) break;
     await sleep(300);
   }
@@ -400,7 +374,7 @@ async function pullCoOccurrence() {
   const seeds = trustedWallets();
   if (!seeds.length) { logLine(`  no trusted wallets to mine from`); return []; }
 
-  const hits = new Map();          // wallet -> Set of coins shared
+  const hits = new Map();
   const coinCount = { total: 0 };
   for (const seed of seeds) {
     const coins = await seedCoins(seed);
@@ -420,10 +394,7 @@ async function pullCoOccurrence() {
   for (const [wallet, coinsShared] of hits) {
     if (coinsShared.size < CFG.COOC_MIN_HITS) continue;
     out.push({
-      wallet,
-      boardPnl: 0,
-      boardVolume: 0,
-      boardTrades: 0,
+      wallet, boardPnl: 0, boardVolume: 0, boardTrades: 0,
       cooc: coinsShared.size,
       window: `co-occurrence ×${coinsShared.size}`,
     });
@@ -442,6 +413,41 @@ async function heliusPage(address, before) {
   if (res.status === 429) { await sleep(4000); return null; }
   if (!res.ok) throw new Error(`helius ${res.status}`);
   return res.json();
+}
+
+/* plain JSON-RPC against Helius — signatures-only pagination is 10x cheaper
+   than parsed history and pages at 1,000 not 100 */
+async function rpc(method, params) {
+  const res = await fetch(`https://mainnet.helius-rpc.com/?api-key=${CFG.KEY}`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
+  });
+  if (res.status === 429) { await sleep(4000); return null; }
+  if (!res.ok) throw new Error(`rpc ${res.status}`);
+  const j = await res.json();
+  if (j.error) throw new Error(`rpc ${j.error.message || j.error.code}`);
+  return j.result;
+}
+
+/* parse an explicit list of signatures into the same shape heliusPage returns */
+async function parseSignatures(sigs) {
+  const out = [];
+  for (let i = 0; i < sigs.length; i += 100) {
+    const chunk = sigs.slice(i, i + 100);
+    const res = await fetch(`https://api.helius.xyz/v0/transactions?api-key=${CFG.KEY}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ transactions: chunk }),
+    });
+    if (res.status === 429) { await sleep(4000); i -= 100; continue; }
+    if (!res.ok) throw new Error(`helius parse ${res.status}`);
+    const batch = await res.json();
+    if (Array.isArray(batch)) out.push(...batch);
+    await sleep(300);
+  }
+  out.sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
+  return out;
 }
 
 function solLeg(tx, wallet) {
@@ -792,10 +798,7 @@ async function cycle() {
   try {
     logLine(`cycle ${cycleNo}`);
 
-    /* top the queue up from the leaderboard when it runs low */
     if (DB.queue.length < CFG.MAX_VET_PER_CYCLE) {
-      /* co-occurrence is the only size-blind source, so favour it; fall back
-         to Birdeye smart traders when there is nothing trusted to mine yet */
       const useCooc = trustedWallets().length > 0 && cycleNo % CFG.COOC_EVERY === 0;
       let board = useCooc ? await pullCoOccurrence() : await pullCandidates();
       if (!board.length) board = useCooc ? await pullCandidates() : await pullCoOccurrence();
@@ -863,79 +866,198 @@ async function cycle() {
   }
 }
 
-/* ── TRACE: find the wallet(s) common to a set of coins ──── */
+/* ── TRACE: who was EARLY into a set of coins ─────────────── */
 
-/* Every wallet that BOUGHT this mint, with the first buy time and SOL size.
-   Low-cap coins are small enough to read in full, so no reachability gate. */
-async function coinBuyers(mint) {
+/* pump.fun bonding-curve PDA. Needs @solana/web3.js (already a dependency of
+   the trader in this repo); if it can't be loaded, curve mode is disabled and
+   trace falls back to reading the mint's own history. */
+let PublicKeyCtor = null;
+let web3Tried = false;
+async function loadWeb3() {
+  if (PublicKeyCtor) return true;
+  if (web3Tried) return false;
+  web3Tried = true;
+  try {
+    const m = await import("@solana/web3.js");
+    PublicKeyCtor = m.PublicKey;
+    return true;
+  } catch (e) {
+    logLine(`@solana/web3.js not available (${e.message}) — curve mode off, tracing mint history instead`);
+    return false;
+  }
+}
+function curvePda(mint) {
+  const [pda] = PublicKeyCtor.findProgramAddressSync(
+    [Buffer.from("bonding-curve"), new PublicKeyCtor(mint).toBuffer()],
+    new PublicKeyCtor(PUMP_PROGRAM),
+  );
+  return pda.toBase58();
+}
+
+/* walk an address's signatures back to its first transaction and keep only
+   the OLDEST `keep` — the early buyers live at the end of the pagination,
+   which is exactly where newest-first page caps never reach */
+async function earliestSignatures(address, keep) {
+  let before;
+  const all = [];
+  let reachedStart = false;
+  for (let page = 0; page < CFG.CURVE_SIG_PAGES; page++) {
+    TRACE.step = `${TRACE.step.split(" · ")[0]} · signatures page ${page + 1} (${all.length} so far)`;
+    const r = await rpc("getSignaturesForAddress", [address, { limit: 1000, before }]);
+    if (r === null) { page--; continue; }
+    if (!r.length) { reachedStart = true; break; }
+    all.push(...r);
+    before = r[r.length - 1].signature;
+    if (r.length < 1000) { reachedStart = true; break; }
+    await sleep(150);
+  }
+  const ok = all.filter((s) => !s.err);
+  const oldest = ok.slice(-keep).reverse();   // chronological order
+  return { sigs: oldest.map((s) => s.signature), total: ok.length, reachedStart };
+}
+
+/* buyers from a CHRONOLOGICAL tx list, with buy rank; exclusions applied */
+function extractBuyers(txs, mint, exclude) {
   const buyers = new Map();
-  let before = "";
+  let rank = 0;
+  for (const tx of txs) {
+    const movers = new Set();
+    for (const tr of tx.tokenTransfers || []) {
+      if (tr.mint !== mint) continue;
+      if (tr.toUserAccount) movers.add(tr.toUserAccount);
+    }
+    for (const w of movers) {
+      if (QUOTES.has(w) || PROGRAMS.has(w) || exclude.has(w)) continue;
+      const d = mintDeltas(tx, w)[mint];
+      if (!d || d <= 0) continue;
+      const { paid } = solLeg(tx, w);
+      if (paid < CFG.MIN_BUY_SOL) continue;
+      if (!buyers.has(w)) {
+        rank++;
+        buyers.set(w, { at: tx.timestamp, sol: +paid.toFixed(3), rank });
+      }
+    }
+  }
+  return buyers;
+}
+
+/* CURVE MODE: earliest EARLY_TXS trades on the bonding curve */
+async function coinBuyersCurve(mint, label) {
+  const curve = curvePda(mint);
+  TRACE.step = `${label} (${mint.slice(0, 6)}…) curve`;
+  const { sigs, total, reachedStart } = await earliestSignatures(curve, CFG.EARLY_TXS);
+  if (!sigs.length) return null;                       // not a pump coin / no curve history
+  TRACE.step = `${label} (${mint.slice(0, 6)}…) parsing ${sigs.length} earliest of ${total}`;
+  const txs = await parseSignatures(sigs);
+  const creator = txs.length ? txs[0].feePayer || null : null;
+  const exclude = new Set([curve]);
+  if (creator) exclude.add(creator);
+  const buyers = extractBuyers(txs, mint, exclude);
+  return { buyers, mode: "curve", totalTxs: total, read: txs.length, reachedStart, creator };
+}
+
+/* LEGACY MODE: mint history newest-first, page-capped (kept for non-pump coins) */
+async function coinBuyersLegacy(mint, label) {
+  const raw = [];
   let pages = 0, reachedStart = false;
+  let before = "";
   for (let page = 0; page < CFG.TRACE_PAGES; page++) {
     status = `trace ${mint.slice(0, 6)}… p${page + 1}`;
-    TRACE.step = `reading coin ${TRACE.done + 1}/${TRACE.mints.length} (${mint.slice(0, 6)}…) page ${page + 1}/${CFG.TRACE_PAGES} · ${buyers.size} buyers so far`;
+    TRACE.step = `${label} (${mint.slice(0, 6)}…) mint history page ${page + 1}/${CFG.TRACE_PAGES}`;
     let batch;
     try { batch = await heliusPage(mint, before); } catch { break; }
     if (batch === null) { page--; continue; }
     if (!batch.length) { reachedStart = true; break; }
     pages++;
-    for (const tx of batch) {
-      const movers = new Set();
-      for (const tr of tx.tokenTransfers || []) {
-        if (tr.mint !== mint) continue;
-        if (tr.toUserAccount) movers.add(tr.toUserAccount);
-      }
-      for (const w of movers) {
-        if (QUOTES.has(w) || PROGRAMS.has(w)) continue;
-        const d = mintDeltas(tx, w)[mint];
-        if (!d || d <= 0) continue;
-        const { paid } = solLeg(tx, w);
-        if (paid < CFG.MIN_BUY_SOL) continue;
-        const prev = buyers.get(w);
-        if (!prev || tx.timestamp < prev.at) {
-          buyers.set(w, { at: tx.timestamp, sol: +paid.toFixed(3) });
-        }
-      }
-    }
+    raw.push(...batch);
     before = batch[batch.length - 1].signature;
     if (batch.length < 100) { reachedStart = true; break; }
     await sleep(300);
   }
-  return { buyers, pages, reachedStart };
+  raw.sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
+  const buyers = extractBuyers(raw, mint, new Set());
+  return { buyers, mode: "mint", totalTxs: null, read: raw.length, reachedStart, creator: null, pages };
 }
 
-async function traceCoins(mints) {
-  const perCoin = [];
-  for (const mint of mints.slice(0, CFG.TRACE_MAX_COINS)) {
-    const r = await coinBuyers(mint);
-    perCoin.push({ mint, ...r });
-    TRACE.done++;
-    logLine(`  trace ${mint.slice(0, 6)}…: ${r.buyers.size} buyers over ${r.pages}p${r.reachedStart ? " (full history)" : " (partial)"}`);
-    await sleep(400);
+async function coinBuyers(mint, label, mode) {
+  if (mode === "curve" && PublicKeyCtor) {
+    try {
+      const r = await coinBuyersCurve(mint, label);
+      if (r) return r;
+      logLine(`  ${mint.slice(0, 6)}…: no bonding-curve history, falling back to mint history`);
+    } catch (e) {
+      logLine(`  ${mint.slice(0, 6)}…: curve read failed (${e.message}), falling back to mint history`);
+    }
   }
+  return coinBuyersLegacy(mint, label);
+}
 
-  /* intersect: which wallets bought how many of these coins */
+async function traceCoins(mints, control, opts) {
+  const mode = opts.mode === "mint" ? "mint" : (await loadWeb3()) ? "curve" : "mint";
+  const perCoin = [];
+  const creators = new Map();   // wallet -> coins it created
+
+  const readSet = async (list, kind) => {
+    for (let i = 0; i < list.length; i++) {
+      const mint = list[i];
+      const r = await coinBuyers(mint, `${kind} ${i + 1}/${list.length}`, mode);
+      perCoin.push({ mint, kind, ...r });
+      if (r.creator) {
+        if (!creators.has(r.creator)) creators.set(r.creator, []);
+        creators.get(r.creator).push(mint);
+      }
+      TRACE.done++;
+      logLine(`  trace ${kind} ${mint.slice(0, 6)}…: ${r.buyers.size} early buyers · ${r.mode}${r.totalTxs != null ? ` · ${r.read} of ${r.totalTxs} txs` : ` · ${r.pages}p`}${r.reachedStart ? "" : " (partial)"}`);
+      await sleep(400);
+    }
+  };
+  await readSet(mints, "winner");
+  await readSet(control, "control");
+
+  /* tally: winners count for, controls count against */
+  TRACE.step = "intersecting buyers";
   const tally = new Map();
   for (const c of perCoin) {
     for (const [w, info] of c.buyers) {
-      if (!tally.has(w)) tally.set(w, { wallet: w, coins: [], total: 0 });
+      if (!tally.has(w)) tally.set(w, { wallet: w, coins: [], controls: [], total: 0 });
       const t = tally.get(w);
-      t.coins.push({ mint: c.mint, at: info.at, sol: info.sol });
-      t.total += info.sol;
+      if (c.kind === "winner") {
+        t.coins.push({ mint: c.mint, at: info.at, sol: info.sol, rank: info.rank });
+        t.total += info.sol;
+      } else {
+        t.controls.push({ mint: c.mint, at: info.at, sol: info.sol, rank: info.rank });
+      }
     }
   }
 
-  TRACE.step = "intersecting buyers";
   const ranked = [...tally.values()]
-    .filter((t) => t.coins.length >= 2)
-    .map((t) => ({
-      ...t,
-      hits: t.coins.length,
-      avgSol: +(t.total / t.coins.length).toFixed(3),
-    }))
-    .sort((a, b) => (b.hits - a.hits) || (a.avgSol - b.avgSol));
+    .filter((t) => t.coins.length >= opts.minHits)
+    .map((t) => {
+      const sols = t.coins.map((c) => c.sol);
+      const mean = sols.reduce((a, b) => a + b, 0) / sols.length;
+      const spread = mean > 0 ? Math.max(...sols) / Math.max(1e-9, Math.min(...sols)) : 1;
+      const ranks = t.coins.map((c) => c.rank);
+      return {
+        ...t,
+        hits: t.coins.length,
+        controlHits: t.controls.length,
+        net: t.coins.length - t.controls.length,
+        avgSol: +mean.toFixed(3),
+        avgRank: +(ranks.reduce((a, b) => a + b, 0) / ranks.length).toFixed(1),
+        fixedSize: t.coins.length >= 3 && spread <= 1.15,          // identical stake every coin = bot
+        createdCoins: creators.get(t.wallet) || [],
+      };
+    })
+    .sort((a, b) => (b.net - a.net) || (b.hits - a.hits) || (a.avgRank - b.avgRank));
 
-  return { perCoin: perCoin.map((c) => ({ mint: c.mint, buyers: c.buyers.size, pages: c.pages, full: c.reachedStart })), ranked };
+  return {
+    mode,
+    perCoin: perCoin.map((c) => ({
+      mint: c.mint, kind: c.kind, buyers: c.buyers.size, mode: c.mode,
+      txsRead: c.read, txsTotal: c.totalTxs, full: c.reachedStart, creator: c.creator,
+    })),
+    ranked,
+  };
 }
 
 /* ── dashboard ──────────────────────────────────────────── */
@@ -969,7 +1091,7 @@ function renderPage() {
         <span class="score">${w.score}</span></div>
       <div class="meta"><b>${s.roiPct}% ROI</b> on ${s.matchedCostSol} SOL · ${s.winRatePct}% win · hold ${s.medianHoldMin}m · ${s.closed} round trips</div>
       <div class="meta">pool $${s.medianPoolUsd.toLocaleString()} · ${s.sizeRatio}x my stake · ${s.visiblePct}% visible · ${s.txCount}${s.txCeiling ? "+" : ""} txs · ${s.totalDays}d observed</div>
-      <div class="meta">${w.board?.cooc ? `swims with your good wallets in ${w.board.cooc} coins` : `Birdeye smart_trader · $${(w.board?.boardPnl ?? 0).toLocaleString()} realised`} · vetted ${ago(w.vettedAt)} · last traded ${ago(w.lastActiveTs)}</div>
+      <div class="meta">${w.board?.cooc ? `early alongside your winners in ${w.board.cooc} coins` : `Birdeye smart_trader · $${(w.board?.boardPnl ?? 0).toLocaleString()} realised`} · vetted ${ago(w.vettedAt)} · last traded ${ago(w.lastActiveTs)}</div>
       <div class="meta mono">${esc(w.wallet)}</div>
       <div class="acts">
         <a class="gmgn" href="https://gmgn.ai/sol/address/${esc(w.wallet)}" target="_blank" rel="noopener">Check on GMGN ↗</a>
@@ -1032,12 +1154,12 @@ function renderPage() {
   .warn{background:#241A14;border:1px solid var(--amber);padding:10px 12px;margin-bottom:14px;color:var(--amber);font-size:11px}
 </style></head><body>
   <h1>Wallet <em>hunter</em></h1>
-  <div class="sub">v13 · co-occurrence + smart_trader + /trace → Helius vetting · cycle ${CFG.CYCLE_MINUTES}m · top ${CFG.SHORTLIST_SIZE} · ${persistOk ? "database saved ✓" : "IN MEMORY ONLY"} · <a href="/db.json" style="color:var(--green)">db.json</a> · <a href="/probe" style="color:var(--green)">probe</a> · <a href="/trace" style="color:var(--green)">trace</a></div>
-  <div class="warn">A shortlist, not a verdict. Birdeye tags these as non-bot smart traders; the vetting below only sees one address over ${CFG.VET_DAYS} days. Check each on GMGN, then record pass/fail so the scoring learns which signals actually matter.</div>
+  <div class="sub">v14 · co-occurrence + smart_trader + /trace (curve mode) → Helius vetting · cycle ${CFG.CYCLE_MINUTES}m · top ${CFG.SHORTLIST_SIZE} · ${persistOk ? "database saved ✓" : "IN MEMORY ONLY"} · <a href="/db.json" style="color:var(--green)">db.json</a> · <a href="/probe" style="color:var(--green)">probe</a> · <a href="/trace" style="color:var(--green)">trace</a></div>
+  <div class="warn">A shortlist, not a verdict. The vetting below only sees one address over ${CFG.VET_DAYS} days. Check each on GMGN, then record pass/fail so the scoring learns which signals actually matter.</div>
   ${TRACE.running ? `<div class="box" style="border-color:var(--amber)"><b style="color:var(--amber)">Trace running</b>
     <div class="tline"><span>${esc(TRACE.step)}</span><span>${Math.round((Date.now()-TRACE.startedAt)/1000)}s</span></div></div>`
     : TRACE.result ? `<div class="box"><b>Last trace</b>
-    <div class="tline"><span>${TRACE.result.walletsInTwoOrMore} wallets in 2+ coins</span><span><a href="/trace" style="color:var(--green)">view</a></span></div></div>` : ""}
+    <div class="tline"><span>${TRACE.result.walletsRanked} wallets in ${TRACE.result.minHits}+ winners</span><span><a href="/trace" style="color:var(--green)">view</a></span></div></div>` : ""}
   <div class="status">▶ ${esc(status)}<br>cycles: ${DB.cycles} (${ago(DB.lastCycleAt)}) · sources: co-occurrence + Birdeye smart_trader · trusted seeds: ${trustedWallets().length} · queue ${DB.queue.length}</div>
   <div class="cards">
     <div class="card"><b style="color:var(--green)">${list.length}</b><span>shortlist</span></div>
@@ -1064,12 +1186,22 @@ function renderPage() {
 
 /* ── server + loop ──────────────────────────────────────── */
 
+const parseMints = (s) => String(s || "")
+  .split(/[,\s]+/).map((x) => x.trim()).filter((x) => x.length >= 32 && x.length <= 46);
+
+function readBody(req) {
+  return new Promise((resolve) => {
+    let data = "";
+    req.on("data", (c) => { data += c; if (data.length > 2_000_000) req.destroy(); });
+    req.on("end", () => resolve(data));
+    req.on("error", () => resolve(""));
+  });
+}
+
 http.createServer(async (req, res) => {
   const u = new URL(req.url, "http://x");
   const p = u.pathname;
 
-  /* Dump a raw Birdeye response so we can confirm field names rather than
-     guessing at them. /probe with no args hits the leaderboard. */
   if (p === "/probe") {
     const q = u.searchParams.get("q")
       || `/defi/token_trending?sort_by=volume24hUSD&sort_type=desc&offset=0&limit=3`;
@@ -1102,32 +1234,44 @@ http.createServer(async (req, res) => {
     return res.end();
   }
 
-  /* /trace?mints=A,B,C  — starts in the BACKGROUND and returns immediately.
-     Reload the same URL (or /trace with no mints) to watch progress. */
+  /* /trace — starts in the BACKGROUND and returns immediately.
+       GET  /trace?key=K&mints=A,B,C[&control=X,Y,Z][&min=3][&mode=curve|mint][&queue=1]
+       POST /trace?key=K   body JSON { "mints": [...], "control": [...], "min": 3 }
+     Reload /trace (no mints) to watch progress and read the result. */
   if (p === "/trace") {
     const key = u.searchParams.get("key") || "";
     if (CFG.CONTROL_KEY && key !== CFG.CONTROL_KEY) {
       res.writeHead(403, { "Content-Type": "text/plain" });
       return res.end("bad key");
     }
-    const mints = (u.searchParams.get("mints") || "")
-      .split(",").map((s) => s.trim()).filter((s) => s.length >= 32 && s.length <= 46);
+    let mints = parseMints(u.searchParams.get("mints"));
+    let control = parseMints(u.searchParams.get("control"));
+    let minParam = u.searchParams.get("min");
+    if (req.method === "POST") {
+      try {
+        const body = JSON.parse(await readBody(req) || "{}");
+        if (body.mints) mints = parseMints(Array.isArray(body.mints) ? body.mints.join(",") : body.mints);
+        if (body.control) control = parseMints(Array.isArray(body.control) ? body.control.join(",") : body.control);
+        if (body.min != null) minParam = String(body.min);
+      } catch {}
+    }
+    mints = mints.slice(0, CFG.TRACE_MAX_COINS);
+    control = control.filter((m) => !mints.includes(m)).slice(0, CFG.TRACE_MAX_CONTROL);
+    const mode = u.searchParams.get("mode") === "mint" ? "mint" : "curve";
 
     const elapsed = TRACE.startedAt ? Math.round((Date.now() - TRACE.startedAt) / 1000) : 0;
 
-    /* already running → report progress */
     if (TRACE.running) {
       res.writeHead(200, { "Content-Type": "application/json" });
       return res.end(JSON.stringify({
         state: "RUNNING",
         elapsedSeconds: elapsed,
-        coinsDone: `${TRACE.done}/${TRACE.mints.length}`,
+        coinsDone: `${TRACE.done}/${TRACE.mints.length + TRACE.control.length}`,
         doingNow: TRACE.step,
         note: "Reload this page to refresh progress. Result appears here when done.",
       }, null, 2));
     }
 
-    /* no mints given → show the last result, or explain how to start */
     if (!mints.length) {
       res.writeHead(200, { "Content-Type": "application/json" });
       return res.end(JSON.stringify(
@@ -1137,8 +1281,8 @@ http.createServer(async (req, res) => {
               error: TRACE.error || undefined,
               ...(TRACE.result || {}) }
           : { state: "IDLE",
-              howToStart: "/trace?key=YOURKEY&mints=<mint1>,<mint2>,<mint3>",
-              note: "2-8 mints, comma separated, no spaces. Add &queue=1 to auto-queue the top hits for vetting." },
+              howToStart: "/trace?key=YOURKEY&mints=<mint1>,<mint2>,...&control=<dead1>,<dead2>,...",
+              note: `Up to ${CFG.TRACE_MAX_COINS} winner mints and ${CFG.TRACE_MAX_CONTROL} control mints. Curve mode reads the earliest ${CFG.EARLY_TXS} trades of each pump.fun coin. Add &min=3 to require 3+ winners, &queue=1 to auto-queue the top hits for vetting.` },
         null, 2));
     }
 
@@ -1154,46 +1298,57 @@ http.createServer(async (req, res) => {
       }, null, 2));
     }
 
-    /* start it in the background and answer straight away */
+    const minHits = Math.max(2, Number(minParam) || (mints.length >= 6 ? 3 : 2));
     running = true;
-    TRACE.running = true; TRACE.startedAt = Date.now(); TRACE.mints = mints;
+    TRACE.running = true; TRACE.startedAt = Date.now(); TRACE.mints = mints; TRACE.control = control;
     TRACE.done = 0; TRACE.step = "starting"; TRACE.result = null; TRACE.error = null;
     const wantQueue = u.searchParams.get("queue") === "1";
 
     (async () => {
       try {
-        logLine(`trace: ${mints.length} coins`);
-        const out = await traceCoins(mints);
+        logLine(`trace: ${mints.length} winners, ${control.length} controls, min ${minHits}, mode ${mode}`);
+        const out = await traceCoins(mints, control, { minHits, mode });
         let queued = 0;
         if (wantQueue) {
           for (const t of out.ranked.slice(0, 10)) {
-            if (DB.verdicts[t.wallet]) continue;
+            if (DB.verdicts[t.wallet] || t.fixedSize || t.createdCoins.length) continue;
             if (DB.queue.some((q) => q.wallet === t.wallet)) continue;
             DB.queue.push({
               wallet: t.wallet, boardPnl: 0, boardVolume: 0, boardTrades: 0,
-              cooc: t.hits, window: `traced ×${t.hits} coins`,
+              cooc: t.hits, window: `early in ×${t.hits} winners`,
             });
             queued++;
           }
           saveDb();
         }
         TRACE.result = {
+          mode: out.mode,
+          minHits,
           coins: out.perCoin,
-          walletsInTwoOrMore: out.ranked.length,
+          walletsRanked: out.ranked.length,
           queued: wantQueue ? queued : undefined,
-          top: out.ranked.slice(0, 25).map((t) => ({
+          top: out.ranked.slice(0, 40).map((t) => ({
             wallet: t.wallet,
-            boughtCoins: t.hits,
+            winners: t.hits,
+            controls: t.controlHits,
+            net: t.net,
+            avgBuyRank: t.avgRank,
             avgBuySol: t.avgSol,
+            flags: [
+              ...(t.fixedSize ? ["FIXED_SIZE_BOT"] : []),
+              ...(t.createdCoins.length ? [`CREATOR_OF_${t.createdCoins.length}`] : []),
+              ...(t.controlHits >= t.hits ? ["EARLY_IN_EVERYTHING"] : []),
+            ],
             buys: t.coins.map((c) => ({
               coin: c.mint.slice(0, 8) + "…",
               at: new Date(c.at * 1000).toISOString().replace("T", " ").slice(0, 19) + "Z",
+              rank: c.rank,
               sol: c.sol,
             })).sort((a, b) => a.at.localeCompare(b.at)),
             gmgn: `https://gmgn.ai/sol/address/${t.wallet}`,
           })),
         };
-        logLine(`trace done: ${out.ranked.length} wallets in 2+ coins${wantQueue ? `, ${queued} queued` : ""}`);
+        logLine(`trace done: ${out.ranked.length} wallets in ${minHits}+ winners${wantQueue ? `, ${queued} queued` : ""}`);
       } catch (e) {
         TRACE.error = e.message;
         logLine(`trace failed: ${e.message}`);
@@ -1207,9 +1362,12 @@ http.createServer(async (req, res) => {
     res.writeHead(200, { "Content-Type": "application/json" });
     return res.end(JSON.stringify({
       state: "STARTED",
-      coins: mints.length,
-      note: `Reading up to ${CFG.TRACE_PAGES} pages per coin — expect roughly ${mints.length} to ${mints.length * 2} minutes.`,
-      next: "Reload this same URL to watch progress and get the result.",
+      winners: mints.length,
+      controls: control.length,
+      minHits,
+      mode,
+      note: `Curve mode reads the earliest ${CFG.EARLY_TXS} trades per coin — expect roughly 10-20 seconds per coin.`,
+      next: "Reload /trace (without mints) to watch progress and get the result.",
     }, null, 2));
   }
 
@@ -1226,9 +1384,10 @@ http.createServer(async (req, res) => {
   res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
   res.end(renderPage());
 }).listen(CFG.PORT, () => {
-  console.log(`Wallet hunter v13 on ${CFG.PORT} — persistence ${persistOk ? "ON" : "OFF"}`);
+  console.log(`Wallet hunter v14 on ${CFG.PORT} — persistence ${persistOk ? "ON" : "OFF"}`);
   if (!CFG.KEY) { status = "FAILED: HELIUS_API_KEY not set"; return; }
   if (!CFG.BIRDEYE_KEY) { status = "FAILED: BIRDEYE_API_KEY not set"; return; }
+  loadWeb3();
   cycle();
   setInterval(cycle, CFG.CYCLE_MINUTES * 60 * 1000);
 });
