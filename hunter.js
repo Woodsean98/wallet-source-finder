@@ -1,40 +1,49 @@
 /**
- * WALLET HUNTER v10 — WALLET-FIRST. No coins.
+ * WALLET HUNTER v13 — three ways to find a wallet
  * ----------------------------------------------------------------
- * v1-v9 all had the same architectural mistake: they found COINS, then read
- * each coin's transaction history to see who traded it. That meant
+ * v1-v9 all shared one architectural mistake: they found COINS, then read
+ * each coin's transaction history to see who traded it. That meant every
+ * wallet found was one that happened to trade a coin we picked (pick a coin
+ * that pumped and every early buyer looks like a genius), and we could only
+ * read coins whose whole history fits in the Helius page budget — which
+ * excludes essentially every coin anyone actually trades. The numbers: 120
+ * pools scanned, 0 readable. Coins with 60,000+ transactions need 600 pages.
  *
- *   · every wallet found was one that happened to trade a coin we picked
- *     (survivorship bias — pick a coin that pumped and every early buyer
- *      looks like a genius),
- *   · and we could only read coins whose whole history fits in ~15 Helius
- *     pages, which excludes essentially every coin anyone actually trades.
+ * v10 went at it from the wallet end via Birdeye's PnL leaderboard. That
+ * failed differently: ranking by absolute profit only ever surfaces MEV bots
+ * (up to ~900,000 txs/day) and whales. Even Birdeye's non-bot `smart_trader`
+ * tag returned wallets 79x-16,000x a 0.3 SOL stake. No ranking-based source
+ * can reach a trader of that size, because size is what the ranking selects.
  *
- * Yesterday's numbers: 120 pools scanned → 0 readable. Coins with 60,000+
- * transactions need 600 pages. It was never going to work.
+ * So v13 carries THREE sources, none of which rank by profit:
  *
- * v10 goes at it from the wallet end, which is what we wanted all along:
+ *   1. CO-OCCURRENCE (the main one). Take wallets already trusted, find the
+ *      coins they recently bought, read only recent pages of each coin near
+ *      the seed's buy, and queue wallets appearing in several of them.
+ *      Repeat co-occurrence is size-blind — a small trader who keeps turning
+ *      up beside a good wallet ranks the same as a whale. First run turned
+ *      724 neighbours into 31 candidates. Anything marked ✓ passed becomes a
+ *      new seed, so the search widens the longer it runs.
  *
- *   Birdeye's /trader/gainers-losers ranks TRADERS by realised PnL over
- *   1W / 30d / 90d, 100 per page, 10,000 deep. One call returns 100
- *   profitable wallet addresses. No coins involved at any point.
+ *   2. /trace — for callers. People who post coin calls in Telegram buy
+ *      BEFORE they post. Give /trace the coins someone called and it returns
+ *      the wallets that bought several of them, with the timestamp and SOL
+ *      size of every buy so the caller can be told apart from the snipers
+ *      who front-run the same group. One coin has ~1,400 buyers; four coins
+ *      in common has almost none.
  *
- * The pipeline is now:
- *   1. Pull a page of ranked profitable wallets from Birdeye (1 call)
- *   2. Cheap pre-screen via 2 Helius pages — kills bots for 2 calls not 40
- *   3. Full vet on survivors: quantity-matched FIFO, hard exclusions, score
- *   4. Shortlist → your GMGN check → /verdict feedback
+ *   3. Birdeye smart_trader — kept as a fallback when there is nothing
+ *      trusted to mine from yet.
  *
- * Gone: coin discovery, harvesting, reachability gating, GeckoTerminal,
- * the 429 storm, and the survivorship bias. The vetting engine — which was
- * the part that actually worked, and which agreed with GMGN on HSdENm — is
- * carried over unchanged.
+ * Everything then flows through the same vetting engine, which is the part
+ * that actually worked and which has agreed with GMGN on every wallet since
+ * the FIFO fix: cheap pre-screen (2 Helius pages kills a bot for 2 calls
+ * instead of 40), quantity-matched FIFO accounting, hard exclusions, 0-100
+ * scoring, shortlist, and the /verdict feedback loop.
  *
- * NOTE ON BIRDEYE PnL: Birdeye also exposes wallet-level PnL endpoints. I
- * have confirmed /trader/gainers-losers exactly, but not the request shape
- * of the PnL endpoints, so v10 does NOT depend on them. There is a /probe
- * route to dump raw Birdeye responses; once we have seen real output we can
- * wire PnL enrichment in properly rather than guessing.
+ * It remains a SHORTLIST, not a verdict. It sees one address over 30 days;
+ * operators who split flow across wallets still pass. Check every candidate
+ * on GMGN and record pass/fail so the scoring learns which signals matter.
  *
  * This service NEVER trades. It only reads.
  */
@@ -85,6 +94,15 @@ const CFG = {
   COOC_WINDOW_H: Number(process.env.COOC_WINDOW_H || 48),      // +/- hours around seed's buy
   COOC_MIN_HITS: Number(process.env.COOC_MIN_HITS || 2),       // coins in common to qualify
   COOC_EVERY: Number(process.env.COOC_EVERY || 2),             // run every N cycles
+
+  /* ── TRACE (v13) ──
+     Callers in Telegram groups buy BEFORE they post. Give /trace the coins
+     someone called and it returns the wallets that bought ALL of them. One
+     coin has thousands of buyers; four coins in common has almost none, so
+     the intersection is the caller (or their cluster). This is the same
+     co-occurrence maths, aimed at coins you name rather than a seed's. */
+  TRACE_PAGES: Number(process.env.TRACE_PAGES || 25),   // pages per coin
+  TRACE_MAX_COINS: Number(process.env.TRACE_MAX_COINS || 8),
   BOARD_MIN_TRADES: Number(process.env.BOARD_MIN_TRADES || 20),
   BOARD_MIRROR_RATIO: Number(process.env.BOARD_MIRROR_RATIO || 50),
 
@@ -841,6 +859,78 @@ async function cycle() {
   }
 }
 
+/* ── TRACE: find the wallet(s) common to a set of coins ──── */
+
+/* Every wallet that BOUGHT this mint, with the first buy time and SOL size.
+   Low-cap coins are small enough to read in full, so no reachability gate. */
+async function coinBuyers(mint) {
+  const buyers = new Map();
+  let before = "";
+  let pages = 0, reachedStart = false;
+  for (let page = 0; page < CFG.TRACE_PAGES; page++) {
+    status = `trace ${mint.slice(0, 6)}… p${page + 1}`;
+    let batch;
+    try { batch = await heliusPage(mint, before); } catch { break; }
+    if (batch === null) { page--; continue; }
+    if (!batch.length) { reachedStart = true; break; }
+    pages++;
+    for (const tx of batch) {
+      const movers = new Set();
+      for (const tr of tx.tokenTransfers || []) {
+        if (tr.mint !== mint) continue;
+        if (tr.toUserAccount) movers.add(tr.toUserAccount);
+      }
+      for (const w of movers) {
+        if (QUOTES.has(w) || PROGRAMS.has(w)) continue;
+        const d = mintDeltas(tx, w)[mint];
+        if (!d || d <= 0) continue;
+        const { paid } = solLeg(tx, w);
+        if (paid < CFG.MIN_BUY_SOL) continue;
+        const prev = buyers.get(w);
+        if (!prev || tx.timestamp < prev.at) {
+          buyers.set(w, { at: tx.timestamp, sol: +paid.toFixed(3) });
+        }
+      }
+    }
+    before = batch[batch.length - 1].signature;
+    if (batch.length < 100) { reachedStart = true; break; }
+    await sleep(300);
+  }
+  return { buyers, pages, reachedStart };
+}
+
+async function traceCoins(mints) {
+  const perCoin = [];
+  for (const mint of mints.slice(0, CFG.TRACE_MAX_COINS)) {
+    const r = await coinBuyers(mint);
+    perCoin.push({ mint, ...r });
+    logLine(`  trace ${mint.slice(0, 6)}…: ${r.buyers.size} buyers over ${r.pages}p${r.reachedStart ? " (full history)" : " (partial)"}`);
+    await sleep(400);
+  }
+
+  /* intersect: which wallets bought how many of these coins */
+  const tally = new Map();
+  for (const c of perCoin) {
+    for (const [w, info] of c.buyers) {
+      if (!tally.has(w)) tally.set(w, { wallet: w, coins: [], total: 0 });
+      const t = tally.get(w);
+      t.coins.push({ mint: c.mint, at: info.at, sol: info.sol });
+      t.total += info.sol;
+    }
+  }
+
+  const ranked = [...tally.values()]
+    .filter((t) => t.coins.length >= 2)
+    .map((t) => ({
+      ...t,
+      hits: t.coins.length,
+      avgSol: +(t.total / t.coins.length).toFixed(3),
+    }))
+    .sort((a, b) => (b.hits - a.hits) || (a.avgSol - b.avgSol));
+
+  return { perCoin: perCoin.map((c) => ({ mint: c.mint, buyers: c.buyers.size, pages: c.pages, full: c.reachedStart })), ranked };
+}
+
 /* ── dashboard ──────────────────────────────────────────── */
 
 const esc = (s) => String(s).replace(/[&<>"']/g, (c) =>
@@ -935,7 +1025,7 @@ function renderPage() {
   .warn{background:#241A14;border:1px solid var(--amber);padding:10px 12px;margin-bottom:14px;color:var(--amber);font-size:11px}
 </style></head><body>
   <h1>Wallet <em>hunter</em></h1>
-  <div class="sub">v12 · co-occurrence + smart_trader discovery → Helius vetting · cycle ${CFG.CYCLE_MINUTES}m · top ${CFG.SHORTLIST_SIZE} · ${persistOk ? "database saved ✓" : "IN MEMORY ONLY"} · <a href="/db.json" style="color:var(--green)">db.json</a> · <a href="/probe" style="color:var(--green)">probe</a></div>
+  <div class="sub">v13 · co-occurrence + smart_trader + /trace → Helius vetting · cycle ${CFG.CYCLE_MINUTES}m · top ${CFG.SHORTLIST_SIZE} · ${persistOk ? "database saved ✓" : "IN MEMORY ONLY"} · <a href="/db.json" style="color:var(--green)">db.json</a> · <a href="/probe" style="color:var(--green)">probe</a> · <a href="/trace" style="color:var(--green)">trace</a></div>
   <div class="warn">A shortlist, not a verdict. Birdeye tags these as non-bot smart traders; the vetting below only sees one address over ${CFG.VET_DAYS} days. Check each on GMGN, then record pass/fail so the scoring learns which signals actually matter.</div>
   <div class="status">▶ ${esc(status)}<br>cycles: ${DB.cycles} (${ago(DB.lastCycleAt)}) · sources: co-occurrence + Birdeye smart_trader · trusted seeds: ${trustedWallets().length} · queue ${DB.queue.length}</div>
   <div class="cards">
@@ -1001,6 +1091,70 @@ http.createServer(async (req, res) => {
     return res.end();
   }
 
+  /* /trace?mints=A,B,C[,D]  — wallets that bought several named coins.
+     Add &queue=1 to push the top hits into the vetting queue. */
+  if (p === "/trace") {
+    const mints = (u.searchParams.get("mints") || "")
+      .split(",").map((s) => s.trim()).filter((s) => s.length >= 32 && s.length <= 46);
+    const key = u.searchParams.get("key") || "";
+    if (CFG.CONTROL_KEY && key !== CFG.CONTROL_KEY) {
+      res.writeHead(403, { "Content-Type": "text/plain" });
+      return res.end("bad key");
+    }
+    if (mints.length < 2) {
+      res.writeHead(400, { "Content-Type": "text/plain" });
+      return res.end("need ?mints=<mint1>,<mint2>[,...]&key=... (2-8 mints)");
+    }
+    if (running) {
+      res.writeHead(429, { "Content-Type": "text/plain" });
+      return res.end("a cycle is running — try again in a minute");
+    }
+    running = true;
+    try {
+      logLine(`trace: ${mints.length} coins`);
+      const out = await traceCoins(mints);
+      const wantQueue = u.searchParams.get("queue") === "1";
+      let queued = 0;
+      if (wantQueue) {
+        for (const t of out.ranked.slice(0, 10)) {
+          if (DB.verdicts[t.wallet]) continue;
+          if (DB.queue.some((q) => q.wallet === t.wallet)) continue;
+          DB.queue.push({
+            wallet: t.wallet, boardPnl: 0, boardVolume: 0, boardTrades: 0,
+            cooc: t.hits, window: `traced ×${t.hits} coins`,
+          });
+          queued++;
+        }
+        saveDb();
+      }
+      const top = out.ranked.slice(0, 25).map((t) => ({
+        wallet: t.wallet,
+        boughtCoins: t.hits,
+        avgBuySol: t.avgSol,
+        buys: t.coins.map((c) => ({
+          coin: c.mint.slice(0, 8) + "…",
+          at: new Date(c.at * 1000).toISOString().replace("T", " ").slice(0, 19) + "Z",
+          sol: c.sol,
+        })).sort((a, b) => a.at.localeCompare(b.at)),
+        gmgn: `https://gmgn.ai/sol/address/${t.wallet}`,
+      }));
+      logLine(`trace done: ${out.ranked.length} wallets in 2+ coins${wantQueue ? `, ${queued} queued` : ""}`);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      return res.end(JSON.stringify({
+        coins: out.perCoin,
+        walletsInTwoOrMore: out.ranked.length,
+        queued: wantQueue ? queued : undefined,
+        top,
+      }, null, 2));
+    } catch (e) {
+      res.writeHead(500, { "Content-Type": "text/plain" });
+      return res.end(`trace failed: ${e.message}`);
+    } finally {
+      running = false;
+      status = `sleeping ${CFG.CYCLE_MINUTES}m · queue ${DB.queue.length}`;
+    }
+  }
+
   if (p === "/db.json") {
     res.writeHead(200, { "Content-Type": "application/json" });
     return res.end(JSON.stringify({ status, cycles: DB.cycles, funnel: DB.funnel, queued: DB.queue.length, verdicts: DB.verdicts, wallets: DB.wallets }, null, 2));
@@ -1014,7 +1168,7 @@ http.createServer(async (req, res) => {
   res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
   res.end(renderPage());
 }).listen(CFG.PORT, () => {
-  console.log(`Wallet hunter v12 on ${CFG.PORT} — persistence ${persistOk ? "ON" : "OFF"}`);
+  console.log(`Wallet hunter v13 on ${CFG.PORT} — persistence ${persistOk ? "ON" : "OFF"}`);
   if (!CFG.KEY) { status = "FAILED: HELIUS_API_KEY not set"; return; }
   if (!CFG.BIRDEYE_KEY) { status = "FAILED: BIRDEYE_API_KEY not set"; return; }
   cycle();
